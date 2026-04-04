@@ -72,6 +72,17 @@ async function bootstrap() {
   app.use('/api/email', emailRoutes);
   app.use('/api/calendar', calendarRoutes);
 
+  // Serve React client build in production
+  if (process.env.NODE_ENV === 'production') {
+    const clientDist = path.resolve(__dirname, '../../client/dist');
+    app.use(express.static(clientDist));
+    // All non-API routes serve index.html (React SPA routing)
+    app.get(/^\/(?!api|uploads|avatars|socket\.io).*/, (_req, res) => {
+      res.sendFile(path.join(clientDist, 'index.html'));
+    });
+    console.log('[SERVER] Serving client from', clientDist);
+  }
+
   // Health check
   app.get('/api/health', (req, res) => {
     res.json({
