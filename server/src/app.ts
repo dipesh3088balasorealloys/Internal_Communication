@@ -1,5 +1,7 @@
 import express from 'express';
-import { createServer, IncomingMessage } from 'http';
+import { createServer as createHttpServer, IncomingMessage } from 'http';
+import { createServer as createHttpsServer } from 'https';
+import fs from 'fs';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
@@ -45,7 +47,15 @@ async function bootstrap() {
 
   // 4. Create Express app
   const app = express();
-  const httpServer = createServer(app);
+
+  // Use HTTPS if certificates exist (required for WebRTC mic/camera)
+  const certPath = path.resolve(__dirname, '../../certs/server.crt');
+  const keyPath = path.resolve(__dirname, '../../certs/server.key');
+  const hasSSL = fs.existsSync(certPath) && fs.existsSync(keyPath);
+  const httpServer = hasSSL
+    ? createHttpsServer({ cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) }, app)
+    : createHttpServer(app);
+  if (hasSSL) console.log('[SERVER] HTTPS enabled with SSL certificate');
 
   // Middleware
   app.use(helmet({
@@ -54,7 +64,6 @@ async function bootstrap() {
     crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy: false,
     originAgentCluster: false,
-    hsts: false,
   }));
   app.use(compression());
   app.use(cors({
