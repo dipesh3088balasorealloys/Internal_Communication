@@ -100,7 +100,7 @@ interface CallState {
   endGroupCall: () => void;
 }
 
-export const useCallStore = create<CallState>((set) => {
+export const useCallStore = create<CallState>((set, get) => {
   // Setup WebRTC event handlers
   webrtcService.onRegistered = () => {
     set({ isReady: true });
