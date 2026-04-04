@@ -48,7 +48,14 @@ async function bootstrap() {
   const httpServer = createServer(app);
 
   // Middleware
-  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+  app.use(helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginOpenerPolicy: false,
+    originAgentCluster: false,
+    hsts: false,
+  }));
   app.use(compression());
   app.use(cors({
     origin: config.isDev ? true : config.clientUrl, // Allow all origins in dev for LAN testing
