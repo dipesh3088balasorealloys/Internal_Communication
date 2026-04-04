@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Build output
+server/dist/
+client/dist/
+
+# Data files (created at runtime)
+data/
+stalwart_data/
+
+# Environment (contains passwords)
+server/.env
+
+# Docker volumes
+postgres_data/
+redis_data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Claude session files
+.claude/

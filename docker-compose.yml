@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: connecthub-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: connecthub
+      POSTGRES_USER: connecthub
+      POSTGRES_PASSWORD: connecthub_dev_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connecthub"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: connecthub-redis
+    restart: unless-stopped
+    command: redis-server --requirepass connecthub_redis_2026
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "connecthub_redis_2026", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  stalwart:
+    image: stalwartlabs/stalwart:latest
+    container_name: connecthub-mail
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "25:25"
+      - "587:587"
+      - "143:143"
+      - "993:993"
+      - "4190:4190"
+    volumes:
+      - stalwart_data:/opt/stalwart
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 25 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+  stalwart_data:

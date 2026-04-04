@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+@theme {
+  /* Brand Colors - Professional Teams-like palette */
+  --color-primary: #6264A7;
+  --color-primary-dark: #4B4D8C;
+  --color-primary-light: #8B8CC7;
+  --color-primary-50: #F0F0FA;
+  --color-primary-100: #E0E1F5;
+
+  --color-surface: #FFFFFF;
+  --color-surface-secondary: #F5F5F5;
+  --color-surface-hover: #F0F0F0;
+  --color-surface-active: #E8E8EC;
+
+  --color-sidebar: #292A3E;
+  --color-sidebar-hover: #3D3D56;
+  --color-sidebar-active: #5B5FC7;
+  --color-sidebar-text: #B8B9D0;
+
+  --color-text-primary: #242424;
+  --color-text-secondary: #616161;
+  --color-text-disabled: #A0A0A0;
+
+  --color-border: #E0E0E0;
+  --color-border-light: #F0F0F0;
+
+  --color-success: #13A10E;
+  --color-warning: #F7630C;
+  --color-danger: #D13438;
+  --color-info: #0078D4;
+
+  --color-online: #6BB700;
+  --color-away: #F7630C;
+  --color-busy: #D13438;
+  --color-offline: #8A8886;
+  --color-dnd: #D13438;
+
+  --font-sans: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Roboto', sans-serif;
+}
+
+/* Base styles */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+  background: var(--color-surface);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #C4C4C4;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #A0A0A0;
+}
+
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Animation keyframes */
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.animate-slide-in {
+  animation: slideIn 0.2s ease-out;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.15s ease-out;
+}
+
+.animate-scale-in {
+  animation: scaleIn 0.2s ease-out;
+}
+
+/* Mirror for local video */
+.mirror {
+  transform: scaleX(-1);
+}
