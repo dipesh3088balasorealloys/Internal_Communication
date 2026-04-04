@@ -46,7 +46,7 @@ export default function ChatWindow() {
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Use ref to avoid infinite loop
-  const prevConvIdRef = useRef<string | undefined>();
+  const prevConvIdRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     if (conversationId && conversationId !== prevConvIdRef.current) {
