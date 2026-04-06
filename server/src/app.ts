@@ -9,7 +9,7 @@ import morgan from 'morgan';
 import path from 'path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { config } from './config';
-import { testConnection } from './database/connection';
+import { testConnection, query } from './database/connection';
 import { runMigrations } from './database/migrate';
 import { initRedis } from './services/redis.service';
 import { initSocketIO } from './services/socket.service';
@@ -41,6 +41,10 @@ async function bootstrap() {
     console.error('Migration failed:', err);
     process.exit(1);
   }
+
+  // 2b. Reset all users to offline on server start (clean state)
+  await query('UPDATE users SET status = $1', ['offline']);
+  console.log('[DB] All users reset to offline');
 
   // 3. Init Redis
   await initRedis();
