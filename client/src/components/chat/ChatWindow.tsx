@@ -49,61 +49,66 @@ export default function ChatWindow() {
   const prevConvIdRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
-    if (conversationId && conversationId !== prevConvIdRef.current) {
-      prevConvIdRef.current = conversationId;
-      let conv = conversations.find((c) => c.id === conversationId);
+    if (!conversationId) {
+      prevConvIdRef.current = undefined;
+      return;
+    }
 
-      // If conversation not in store yet (just created), fetch it and refresh list
-      if (!conv) {
+    const conv = conversations.find((c) => c.id === conversationId);
+
+    // If conversation not in store yet (just created), fetch it from API
+    if (!conv) {
+      if (prevConvIdRef.current !== conversationId) {
+        prevConvIdRef.current = conversationId;
         api.get(`/conversations/${conversationId}`).then(({ data }) => {
           useChatStore.getState().fetchConversations();
           setActiveConversation(data);
           fetchMessages(conversationId);
         }).catch(() => {});
-        return;
+      }
+      return;
+    }
+
+    // Load conversation if changed or not yet active
+    if (conversationId !== prevConvIdRef.current || !activeConversation) {
+      prevConvIdRef.current = conversationId;
+      setActiveConversation(conv);
+      fetchMessages(conversationId);
+
+      // Fetch full conversation details (includes members array) for group chats
+      if (conv.type === 'group' && (!conv.members || conv.members.length === 0)) {
+        api.get(`/conversations/${conversationId}`).then(({ data }) => {
+          if (data.members) {
+            const members = data.members.map((m: any) => ({
+              user_id: m.id || m.user_id,
+              username: m.username,
+              display_name: m.display_name,
+              avatar_url: m.avatar_url || null,
+              role: m.role,
+              status: m.status,
+            }));
+            useChatStore.getState().updateConversation(conversationId, { members });
+            const current = useChatStore.getState().activeConversation;
+            if (current && current.id === conversationId) {
+              useChatStore.getState().setActiveConversation({ ...current, members });
+            }
+          }
+        }).catch((err) => console.error('Failed to fetch conversation details:', err));
       }
 
-      if (conv) {
-        setActiveConversation(conv);
-        fetchMessages(conversationId);
-        // Fetch full conversation details (includes members array) for group chats
-        if (conv.type === 'group' && (!conv.members || conv.members.length === 0)) {
-          api.get(`/conversations/${conversationId}`).then(({ data }) => {
-            if (data.members) {
-              // Normalize member fields: server returns 'id', client expects 'user_id'
-              const members = data.members.map((m: any) => ({
-                user_id: m.id || m.user_id,
-                username: m.username,
-                display_name: m.display_name,
-                avatar_url: m.avatar_url || null,
-                role: m.role,
-                status: m.status,
-              }));
-              useChatStore.getState().updateConversation(conversationId, { members });
-              // Also update the active conversation so the panel re-renders
-              const current = useChatStore.getState().activeConversation;
-              if (current && current.id === conversationId) {
-                useChatStore.getState().setActiveConversation({ ...current, members });
-              }
-            }
-          }).catch((err) => console.error('Failed to fetch conversation details:', err));
-        }
-      }
       // Reset panels when switching conversations
       setShowSearch(false);
       setShowMembers(false);
       setShowMore(false);
       setSearchText('');
     }
-    if (!conversationId) {
-      prevConvIdRef.current = undefined;
-    }
+
     return () => {
       setActiveConversation(null);
       prevConvIdRef.current = undefined;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversationId]);
+  }, [conversationId, conversations.length]);
 
   // Focus search input when opened
   useEffect(() => {

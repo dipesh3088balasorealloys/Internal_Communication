@@ -55,6 +55,15 @@ export async function getOnlineUsers(): Promise<string[]> {
   return await redisClient.sMembers('online_users');
 }
 
+export async function clearAllPresence() {
+  await redisClient.del('online_users');
+  // Clear all presence:* keys
+  const keys = await redisClient.keys('presence:*');
+  if (keys.length > 0) {
+    await redisClient.del(keys);
+  }
+}
+
 export async function refreshPresence(userId: string) {
   const status = await getUserStatus(userId);
   if (status !== 'offline') {

@@ -11,7 +11,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { config } from './config';
 import { testConnection, query } from './database/connection';
 import { runMigrations } from './database/migrate';
-import { initRedis } from './services/redis.service';
+import { initRedis, clearAllPresence } from './services/redis.service';
 import { initSocketIO } from './services/socket.service';
 
 // Routes
@@ -46,8 +46,10 @@ async function bootstrap() {
   await query('UPDATE users SET status = $1', ['offline']);
   console.log('[DB] All users reset to offline');
 
-  // 3. Init Redis
+  // 3. Init Redis + clear stale presence
   await initRedis();
+  await clearAllPresence();
+  console.log('[REDIS] All presence data cleared');
 
   // 4. Create Express app
   const app = express();

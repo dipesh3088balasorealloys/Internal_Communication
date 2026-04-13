@@ -4,12 +4,13 @@ import {
   Eye, EyeOff, Loader2, ArrowRight,
   Shield, Zap, Users, Lock,
 } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { useAuthStore } from '@/stores/authStore';
 import { useWindowSize, BREAKPOINTS } from '@/hooks/useWindowSize';
 
 export default function LoginPage() {
   const navigate = useNavigate();
-  const { login, isLoading, error, clearError } = useAuthStore();
+  const { login, previewLogin, isLoading, error, clearError } = useAuthStore();
   const [username, setUsername]         = useState('');
   const [password, setPassword]         = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -26,6 +27,7 @@ export default function LoginPage() {
     catch { /* error set in store */ }
   };
 
+  const handlePreview = () => { previewLogin(); navigate('/'); };
   const canSubmit = username.trim() && password.trim() && !isLoading;
 
   const inputStyle = (field: string): React.CSSProperties => ({
@@ -90,14 +92,16 @@ export default function LoginPage() {
       }}>
 
         {/* ══ Single Glass Container ══ */}
-        <div
-          className="login-container"
+        <motion.div
+          initial={{ opacity: 0, y: 28 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
           style={{
             display: 'flex',
             flexDirection: isMobile ? 'column' : 'row',
             width: '100%',
-            maxWidth: isMobile ? 380 : isTablet ? 640 : 820,
-            maxHeight: '92vh',
+            maxWidth: isMobile ? 420 : isTablet ? 720 : 940,
+            minHeight: isMobile ? 'auto' : 560,
             borderRadius: 24,
             background: 'rgba(255,255,255,0.12)',
             backdropFilter: 'blur(28px)',
@@ -105,28 +109,29 @@ export default function LoginPage() {
             border: '1px solid rgba(255,255,255,0.26)',
             boxShadow: '0 24px 64px rgba(0,0,0,0.45), 0 4px 16px rgba(0,0,0,0.22)',
             overflow: 'hidden',
-            animation: 'fadeSlideUp 0.55s ease-out',
           }}
         >
 
           {/* ══ LEFT — Branding ══ */}
           {showBrandingPanel && (
-            <div
+            <motion.div
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ duration: 0.55, delay: 0.1, ease: [0.16, 1, 0.3, 1] }}
               style={{
                 flex: 1,
                 display: 'flex',
                 flexDirection: 'column',
                 alignItems: 'center',
                 justifyContent: 'center',
-                padding: isTablet ? '28px 24px' : '32px 36px',
+                padding: isTablet ? '40px 32px' : '48px 44px',
                 borderRight: '1px solid rgba(255,255,255,0.16)',
                 textAlign: 'center',
                 background: 'rgba(255,255,255,0.05)',
-                animation: 'fadeSlideLeft 0.55s ease-out',
               }}
             >
               {/* Logo */}
-              <div style={{ width: 150, height: 150, marginBottom: 18, flexShrink: 0 }}>
+              <div style={{ width: 210, height: 210, marginBottom: 28, flexShrink: 0 }}>
                 <img
                   src="/BAL-CONNECT-LOGO.PNG"
                   alt="BAL Connect"
@@ -136,7 +141,7 @@ export default function LoginPage() {
 
               {/* Brand title */}
               <h1 style={{
-                fontSize: isTablet ? 20 : 24,
+                fontSize: isTablet ? 24 : 28,
                 fontWeight: 800, color: '#fff',
                 lineHeight: 1.2, margin: '0 0 10px',
                 letterSpacing: '-0.5px',
@@ -155,7 +160,7 @@ export default function LoginPage() {
 
               <p style={{
                 fontSize: 13, color: 'rgba(255,255,255,0.65)',
-                lineHeight: 1.6, margin: '0 0 16px',
+                lineHeight: 1.7, margin: '0 0 32px',
                 maxWidth: 280,
               }}>
                 Secure messaging, HD voice & video calls, and file sharing — built for the BAL team.
@@ -163,34 +168,36 @@ export default function LoginPage() {
 
               {/* Feature cards */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: '100%', maxWidth: 300 }}>
-                <FeatureCard emoji="⚡" title="Real-time Messaging" desc="Channels, DMs, threads & reactions" />
-                <FeatureCard emoji="📹" title="HD Voice & Video Calls" desc="Powered by Pure WebRTC" />
-                <FeatureCard emoji="🛡️" title="Enterprise Security" desc="Private network, admin compliance tools" />
+                <FeatureCard emoji="⚡" icon={<Zap size={15} color="#FF8C00" />} title="Real-time Messaging"    desc="Channels, DMs, threads & reactions" />
+                <FeatureCard emoji="📹" icon={<Users size={15} color="#FF8C00" />} title="HD Voice & Video Calls" desc="Powered by enterprise SIP infrastructure" />
+                <FeatureCard emoji="🛡️" icon={<Shield size={15} color="#FF8C00" />} title="Enterprise Security"    desc="Private network, admin compliance tools" />
               </div>
 
               {/* Footer */}
               <div style={{
-                marginTop: 18,
+                marginTop: 32,
                 display: 'flex', alignItems: 'center', gap: 6,
                 fontSize: 11, color: 'rgba(255,255,255,0.35)',
               }}>
                 <Lock size={10} color="rgba(255,255,255,0.35)" />
                 Internal use only — Private network &nbsp;|&nbsp; TLS Encrypted
               </div>
-            </div>
+            </motion.div>
           )}
 
           {/* ══ RIGHT — Login Form ══ */}
-          <div
+          <motion.div
+            initial={{ opacity: 0, x: 20 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ duration: 0.55, delay: 0.15, ease: [0.16, 1, 0.3, 1] }}
             style={{
-              width: isMobile ? '100%' : isTablet ? 300 : 360,
+              width: isMobile ? '100%' : isTablet ? 320 : 400,
               flexShrink: 0,
               display: 'flex',
               flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
-              padding: isMobile ? '28px 24px' : isTablet ? '28px 24px' : '32px 36px',
-              animation: 'fadeSlideRight 0.55s ease-out',
+              padding: isMobile ? '36px 28px' : isTablet ? '40px 32px' : '48px 44px',
             }}
           >
             {/* Mobile logo */}
@@ -202,6 +209,7 @@ export default function LoginPage() {
                 <h1 style={{ fontSize: 18, fontWeight: 700, color: '#fff', margin: 0 }}>BAL Connect</h1>
               </div>
             )}
+
 
             {/* Form title */}
             <h2 style={{
@@ -218,27 +226,31 @@ export default function LoginPage() {
             </p>
 
             {/* Error banner */}
-            {error && (
-              <div
-                style={{
-                  width: '100%',
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  padding: '11px 14px', borderRadius: 10,
-                  background: 'rgba(220,38,38,0.20)',
-                  border: '1px solid rgba(220,38,38,0.40)',
-                  marginBottom: 18, fontSize: 13, fontWeight: 500, color: '#FCA5A5',
-                  animation: 'fadeSlideUp 0.3s ease-out',
-                }}
-              >
-                <div style={{
-                  width: 20, height: 20, borderRadius: '50%',
-                  background: 'rgba(220,38,38,0.30)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 11, fontWeight: 700, flexShrink: 0, color: '#FCA5A5',
-                }}>!</div>
-                {error}
-              </div>
-            )}
+            <AnimatePresence>
+              {error && (
+                <motion.div
+                  initial={{ opacity: 0, y: -8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  style={{
+                    width: '100%',
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '11px 14px', borderRadius: 10,
+                    background: 'rgba(220,38,38,0.20)',
+                    border: '1px solid rgba(220,38,38,0.40)',
+                    marginBottom: 18, fontSize: 13, fontWeight: 500, color: '#FCA5A5',
+                  }}
+                >
+                  <div style={{
+                    width: 20, height: 20, borderRadius: '50%',
+                    background: 'rgba(220,38,38,0.30)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 11, fontWeight: 700, flexShrink: 0, color: '#FCA5A5',
+                  }}>!</div>
+                  {error}
+                </motion.div>
+              )}
+            </AnimatePresence>
 
             {/* Form */}
             <form onSubmit={handleSubmit} style={{ width: '100%' }}>
@@ -303,9 +315,11 @@ export default function LoginPage() {
               </div>
 
               {/* Sign In Button */}
-              <button
+              <motion.button
                 type="submit"
                 disabled={!canSubmit}
+                whileHover={canSubmit ? { scale: 1.015 } : {}}
+                whileTap={canSubmit ? { scale: 0.975 } : {}}
                 style={{
                   width: '100%',
                   padding: isMobile ? '13px 20px' : '14px 24px',
@@ -319,7 +333,7 @@ export default function LoginPage() {
                   cursor: canSubmit ? 'pointer' : 'not-allowed',
                   display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 9,
                   boxShadow: canSubmit ? '0 6px 22px rgba(98,100,167,0.50)' : 'none',
-                  transition: 'all 0.2s',
+                  transition: 'box-shadow 0.2s, background 0.2s',
                   marginBottom: 20,
                 }}
               >
@@ -328,7 +342,7 @@ export default function LoginPage() {
                 ) : (
                   <><span>Sign In</span><ArrowRight size={16} /></>
                 )}
-              </button>
+              </motion.button>
             </form>
 
             {/* Divider */}
@@ -337,6 +351,32 @@ export default function LoginPage() {
               <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.38)', fontWeight: 600, letterSpacing: '0.5px' }}>OR</span>
               <div style={{ flex: 1, height: 1, background: 'rgba(255,255,255,0.15)' }} />
             </div>
+
+            {/* Preview Demo Button */}
+            <motion.button
+              type="button"
+              onClick={handlePreview}
+              whileHover={{ scale: 1.012 }}
+              whileTap={{ scale: 0.985 }}
+              style={{
+                width: '100%',
+                padding: isMobile ? '12px 20px' : '13px 24px',
+                fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+                color: '#FFB347',
+                background: 'rgba(255,140,0,0.12)',
+                border: '1.5px solid rgba(255,140,0,0.30)',
+                borderRadius: 10,
+                cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+                marginBottom: 20,
+                transition: 'all 0.2s',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,140,0,0.20)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255,140,0,0.12)'; }}
+            >
+              <Eye size={15} />
+              Preview Demo (No Backend)
+            </motion.button>
 
             {/* Register link */}
             <div style={{ textAlign: 'center' }}>
@@ -350,9 +390,9 @@ export default function LoginPage() {
                 Create account
               </Link>
             </div>
-          </div>
+          </motion.div>
 
-        </div>
+        </motion.div>
       </div>
 
       {/* Footer */}
@@ -367,9 +407,6 @@ export default function LoginPage() {
 
       <style>{`
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        @keyframes fadeSlideUp { from { opacity: 0; transform: translateY(28px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes fadeSlideLeft { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
-        @keyframes fadeSlideRight { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
         input::placeholder { color: rgba(255,255,255,0.32) !important; }
         input:-webkit-autofill,
         input:-webkit-autofill:hover,
@@ -386,11 +423,14 @@ export default function LoginPage() {
 /* ═══════════════════════════════════════════════════════
    Feature Card
 ═══════════════════════════════════════════════════════ */
-function FeatureCard({ emoji, title, desc }: {
-  emoji: string; title: string; desc: string;
+function FeatureCard({ icon: _icon, emoji, title, desc }: {
+  icon: React.ReactNode; emoji: string; title: string; desc: string;
 }) {
   return (
-    <div
+    <motion.div
+      initial={{ opacity: 0, x: -12 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={{ duration: 0.4, delay: 0.35, ease: 'easeOut' }}
       style={{
         display: 'flex', alignItems: 'center', gap: 12,
         padding: '11px 14px', borderRadius: 12,
@@ -412,6 +452,6 @@ function FeatureCard({ emoji, title, desc }: {
         <div style={{ fontSize: 13, fontWeight: 600, color: '#fff', marginBottom: 2 }}>{title}</div>
         <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.50)', lineHeight: 1.4 }}>{desc}</div>
       </div>
-    </div>
+    </motion.div>
   );
 }

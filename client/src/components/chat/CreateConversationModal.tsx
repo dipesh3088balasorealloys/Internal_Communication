@@ -64,7 +64,7 @@ export default function CreateConversationModal({ onClose }: Props) {
         type: 'direct',
         memberIds: [user.id],
       });
-      if (!data.existing) addConversation(data);
+      await useChatStore.getState().fetchConversations();
       setSidebarTab('chat');
       navigate(`/chat/${data.id}`);
       onClose();
@@ -83,7 +83,7 @@ export default function CreateConversationModal({ onClose }: Props) {
         name: groupName.trim(),
         memberIds: selectedUsers.map((u) => u.id),
       });
-      addConversation(data);
+      await useChatStore.getState().fetchConversations();
       setSidebarTab('chat');
       navigate(`/chat/${data.id}`);
       onClose();

@@ -91,17 +91,8 @@ export default function ContactsList({ searchQuery }: ContactsListProps) {
         type: 'direct',
         memberIds: [userId],
       });
-      // Add to chat store so it appears in the list immediately
-      if (!data.existing) {
-        // New conversation — fetch full details and add to store
-        try {
-          const { data: fullConv } = await api.get(`/conversations/${data.id}`);
-          useChatStore.getState().addConversation(fullConv);
-        } catch {
-          useChatStore.getState().fetchConversations();
-        }
-      }
-      // Switch sidebar to chat tab and navigate to the conversation
+      // Always refresh conversation list and wait for it before navigating
+      await useChatStore.getState().fetchConversations();
       setSidebarTab('chat');
       navigate(`/chat/${data.id}`);
     } catch (err) {
