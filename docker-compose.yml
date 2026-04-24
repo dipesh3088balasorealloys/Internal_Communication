@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: connecthub
       POSTGRES_USER: connecthub
-      POSTGRES_PASSWORD: connecthub_dev_2026
+      POSTGRES_PASSWORD: connecthub_prod_2026
     ports:
       - "5432:5432"
     volumes:
@@ -21,13 +21,13 @@ services:
     image: redis:7-alpine
     container_name: connecthub-redis
     restart: unless-stopped
-    command: redis-server --requirepass connecthub_redis_2026
+    command: redis-server --requirepass connecthub_redis_prod_2026
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "connecthub_redis_2026", "ping"]
+      test: ["CMD", "redis-cli", "-a", "connecthub_redis_prod_2026", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -48,7 +48,73 @@ services:
     healthcheck:
       disable: true
 
+  app:
+    build: .
+    image: bal-connect-app
+    container_name: connecthub-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: connecthub
+      DB_USER: connecthub
+      DB_PASSWORD: connecthub_prod_2026
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: connecthub_redis_prod_2026
+      # Stalwart SMTP (primary — all outbound)
+      STALWART_SMTP_HOST: stalwart
+      STALWART_SMTP_PORT: 587
+      STALWART_SMTP_USER: admin
+      STALWART_SMTP_PASSWORD: kluwZPlOPr
+      STALWART_SMTP_SECURE: "false"
+      STALWART_DOMAIN: balasorealloys.in
+      # IMAP (Stalwart inbox reading)
+      IMAP_HOST: stalwart
+      IMAP_PORT: 143
+      IMAP_USER: admin
+      IMAP_PASSWORD: kluwZPlOPr
+      IMAP_SECURE: "false"
+      # JWT
+      JWT_SECRET: bal_connect_jwt_secret_production_2026_xK9mP2
+      JWT_REFRESH_SECRET: bal_connect_refresh_secret_production_2026_yL8nQ3
+      JWT_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      # Uploads
+      MAX_FILE_SIZE: 104857600
+      AVATAR_DIR: ../data/avatars
+      UPLOAD_DIR: ../data/files
+      # Client
+      CLIENT_URL: http://192.168.10.15
+      # Email from
+      SMTP_FROM_NAME: BAL Connect
+    volumes:
+      - app_data:/app/data
+
+  nginx:
+    image: nginx:1.24-alpine
+    container_name: connecthub-nginx
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+
 volumes:
   postgres_data:
   redis_data:
   stalwart_data:
+  app_data:
