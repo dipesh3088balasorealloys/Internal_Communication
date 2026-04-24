@@ -46,10 +46,11 @@ services:
     volumes:
       - stalwart_data:/opt/stalwart
     healthcheck:
-      test: ["CMD", "sh", "-c", "nc -z localhost 25 || exit 1"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "sh", "-c", "(echo > /dev/tcp/127.0.0.1/25) 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 30s
 
 volumes:
   postgres_data:

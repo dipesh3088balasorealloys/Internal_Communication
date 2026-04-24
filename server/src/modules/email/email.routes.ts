@@ -49,24 +49,14 @@ router.post('/send', emailUpload.array('attachments', 10), async (req: AuthReque
 
     // Get sender's email, name, and mail_password from DB
     const senderResult = await query('SELECT email, display_name, mail_password FROM users WHERE id = $1', [req.user!.userId]);
-    const senderEmail = senderResult.rows[0]?.email || process.env.SMTP_FROM_EMAIL || '';
+    const senderEmail = senderResult.rows[0]?.email || '';
     const senderName = senderResult.rows[0]?.display_name || 'BAL Connect';
     const mailPassword = senderResult.rows[0]?.mail_password || '';
 
-    // Check if sending to external domain (via Office 365 relay)
-    const recipients = Array.isArray(to) ? to : [to];
-    const internalDomain = process.env.STALWART_DOMAIN || 'balasorealloys.in';
-    const allInternal = recipients.every((r: string) => r.toLowerCase().endsWith(`@${internalDomain}`));
-    const isExternalRelay = !allInternal && !!process.env.STALWART_SMTP_HOST;
-
-    // For external relay: add sender signature banner at top of email body
+    // All emails sent directly through Stalwart as the actual sender
     let finalHtml = html || undefined;
-    if (isExternalRelay && finalHtml) {
-      const senderBanner = `<div style="background:#f0f4ff;border-left:4px solid #5B5FC7;padding:10px 16px;margin-bottom:16px;border-radius:4px;font-family:Segoe UI,sans-serif;font-size:13px;color:#333;">
-        <strong>From:</strong> ${senderName} &lt;${senderEmail}&gt;<br/>
-        <span style="font-size:11px;color:#666;">Sent via BAL Connect Internal Communication Platform</span>
-      </div>`;
-      finalHtml = senderBanner + finalHtml;
+    if (false) {
+      // Banner removed — no longer using Office 365 relay
     }
 
     const result = await sendEmail({

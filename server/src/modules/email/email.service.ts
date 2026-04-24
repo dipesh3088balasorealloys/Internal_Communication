@@ -1,57 +1,48 @@
 import nodemailer from 'nodemailer';
 
-// Office 365 SMTP — for @balasorealloys.com executives + external relay
-const office365Transport = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.office365.com',
-  port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: process.env.SMTP_SECURE === 'true',
-  auth: {
-    user: process.env.SMTP_USER || '',
-    pass: process.env.SMTP_PASSWORD || '',
-  },
-  tls: {
-    ciphers: 'SSLv3',
-    rejectUnauthorized: false,
-  },
-});
-
 const STALWART_HOST = process.env.STALWART_SMTP_HOST || '';
 const STALWART_PORT = parseInt(process.env.STALWART_SMTP_PORT || '587');
 const STALWART_SECURE = process.env.STALWART_SMTP_SECURE === 'true';
 const INTERNAL_DOMAIN = process.env.STALWART_DOMAIN || 'balasorealloys.in';
-const STALWART_DEFAULT_PASS = process.env.STALWART_SMTP_PASSWORD || '';
 
-// Verify Office 365 on startup
-office365Transport.verify().then(() => {
-  console.log('[EMAIL] Office 365 SMTP connected to', process.env.SMTP_HOST);
-}).catch((err) => {
-  console.warn('[EMAIL] Office 365 SMTP failed:', err.message);
-});
+// Office 365 SMTP — only used for outbound to external domains (@balasorealloys.com, @gmail.com, etc.)
+// Because ISP (BSNL) blocks outbound port 25, Stalwart cannot deliver externally
+// Office 365 on port 587 bypasses the ISP block
+const OFFICE365_HOST = process.env.SMTP_HOST || '';
+const OFFICE365_PORT = parseInt(process.env.SMTP_PORT || '587');
+const OFFICE365_USER = process.env.SMTP_USER || '';
+const OFFICE365_PASS = process.env.SMTP_PASSWORD || '';
+
+let office365Transport: nodemailer.Transporter | null = null;
+if (OFFICE365_HOST && OFFICE365_USER && OFFICE365_PASS) {
+  office365Transport = nodemailer.createTransport({
+    host: OFFICE365_HOST,
+    port: OFFICE365_PORT,
+    secure: false,
+    auth: { user: OFFICE365_USER, pass: OFFICE365_PASS },
+    tls: { ciphers: 'SSLv3', rejectUnauthorized: false },
+  });
+  office365Transport.verify().then(() => {
+    console.log('[EMAIL] Office 365 SMTP relay connected (for external outbound)');
+  }).catch((err) => {
+    console.warn('[EMAIL] Office 365 SMTP relay failed:', err.message);
+  });
+}
 
 // Per-user Stalwart SMTP — each user authenticates with their own mail_password
-// mail_password is stored separately in users table, NOT the BAL Connect login password
-function createUserStalwartTransport(userLoginName: string, mailPassword: string): nodemailer.Transporter | null {
-  if (!STALWART_HOST) return null;
+function createUserStalwartTransport(userLoginName: string, mailPassword: string): nodemailer.Transporter {
   return nodemailer.createTransport({
     host: STALWART_HOST,
     port: STALWART_PORT,
     secure: STALWART_SECURE,
-    auth: {
-      user: userLoginName,
-      pass: mailPassword,
-    },
+    auth: { user: userLoginName, pass: mailPassword },
     tls: { rejectUnauthorized: false },
   });
 }
 
-// Smart routing: internal recipients → Stalwart, external → Office 365
-function isInternalRecipient(to: string | string[]): boolean {
-  const recipients = Array.isArray(to) ? to : [to];
-  return recipients.every(r => r.toLowerCase().endsWith(`@${INTERNAL_DOMAIN}`));
+if (STALWART_HOST) {
+  console.log('[EMAIL] Stalwart SMTP configured at', STALWART_HOST + ':' + STALWART_PORT);
 }
-
-// Keep backward compat
-const transporter = office365Transport;
 
 export interface SendEmailOptions {
   to: string | string[];
@@ -69,36 +60,86 @@ export interface SendEmailOptions {
 
 export async function sendEmail(options: SendEmailOptions): Promise<{ messageId: string; accepted: string[] }> {
   const senderEmail = options.fromEmail || '';
-  const senderName = options.fromName || process.env.SMTP_FROM_NAME || 'BAL Connect';
+  const senderName = options.fromName || 'BAL Connect';
   const recipients = Array.isArray(options.to) ? options.to : [options.to];
-
-  // Routing logic:
-  // - @balasorealloys.in recipients → Stalwart (direct internal delivery)
-  // - @balasorealloys.com or external → Office 365 SMTP relay (trusted by Microsoft)
-  const allInternal = recipients.every(r => r.toLowerCase().endsWith(`@${INTERNAL_DOMAIN}`));
   const mailPass = options.mailPassword || '';
   const userLogin = senderEmail ? senderEmail.split('@')[0] : '';
-  const useStalwart = allInternal && !!STALWART_HOST && !!senderEmail && !!mailPass;
+
+  // Check if all recipients are internal (@balasorealloys.in)
+  const allInternal = recipients.every(r => r.toLowerCase().endsWith(`@${INTERNAL_DOMAIN}`));
 
   let transport: nodemailer.Transporter;
   let fromAddress: string;
-  let replyTo: string | undefined = options.replyTo;
 
-  if (useStalwart) {
-    // Internal: each user authenticates as themselves — proper per-account tracking
-    transport = createUserStalwartTransport(userLogin, mailPass)!;
+  if (allInternal && STALWART_HOST && userLogin && mailPass) {
+    // INTERNAL: Send through Stalwart as the actual user
+    transport = createUserStalwartTransport(userLogin, mailPass);
     fromAddress = `"${senderName}" <${senderEmail}>`;
-  } else {
-    // External: send via Office 365 (it.helpdesk), but show sender's name
-    // and set Reply-To so replies go back to the sender's @balasorealloys.in email
+    console.log(`[EMAIL] Routing internal: ${senderEmail} → Stalwart`);
+  } else if (office365Transport) {
+    // EXTERNAL: Send through Office 365 relay (ISP blocks port 25 outbound)
+    // O365 only owns @balasorealloys.com — it cannot send AS @balasorealloys.in
+    // Until M365 accepted domain is configured for balasorealloys.in, we must:
+    //   - Set From to the authenticated O365 account (it.helpdesk@balasorealloys.com)
+    //   - Put the real sender in Reply-To so replies go back to them
     transport = office365Transport;
-    const o365Email = process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER || '';
-    fromAddress = `"${senderName} via BAL Connect" <${o365Email}>`;
-    // In dev: Reply-To uses the Office 365 helpdesk (since @balasorealloys.in has no MX yet)
-    // In production: change this to senderEmail once DNS MX record is configured
-    if (!replyTo) {
-      const o365Reply = process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER || '';
-      replyTo = `"${senderName}" <${o365Reply}>`;
+    const senderDomain = senderEmail.split('@')[1]?.toLowerCase() || '';
+    const office365Domain = OFFICE365_USER.split('@')[1]?.toLowerCase() || '';
+
+    if (senderDomain === office365Domain) {
+      // Sender is @balasorealloys.com — O365 can send as them directly
+      fromAddress = `"${senderName}" <${senderEmail}>`;
+    } else {
+      // Sender is @balasorealloys.in — use O365 account as From, real sender as Reply-To
+      fromAddress = `"${senderName} via BAL Connect" <${OFFICE365_USER}>`;
+      if (!options.replyTo) {
+        options.replyTo = senderEmail;
+      }
+    }
+    console.log(`[EMAIL] Routing external: ${senderEmail} → Office 365 relay (from: ${fromAddress})`);
+  } else if (STALWART_HOST && userLogin && mailPass) {
+    // Fallback: try Stalwart anyway (will queue if port 25 blocked)
+    transport = createUserStalwartTransport(userLogin, mailPass);
+    fromAddress = `"${senderName}" <${senderEmail}>`;
+    console.log(`[EMAIL] Routing fallback: ${senderEmail} → Stalwart`);
+  } else {
+    throw new Error('No email transport available');
+  }
+
+  // When sending via O365 as a different identity (e.g. .in sender via it.helpdesk@.com),
+  // O365 forces its own display name. Inject a sender banner into the body so recipients
+  // always see who actually sent the email. This is removed once M365 accepted domain is set up.
+  const senderDomain = senderEmail.split('@')[1]?.toLowerCase() || '';
+  const office365Domain = OFFICE365_USER.split('@')[1]?.toLowerCase() || '';
+  const needsSenderBanner =
+    transport === office365Transport &&
+    senderDomain &&
+    office365Domain &&
+    senderDomain !== office365Domain;
+
+  let finalHtml = options.html;
+  let finalText = options.text;
+
+  if (needsSenderBanner) {
+    const banner = `
+<div style="background:#f4f6f9;border-left:4px solid #0066cc;padding:10px 14px;margin-bottom:16px;font-family:Arial,sans-serif;font-size:13px;color:#333;">
+  <div><strong>From:</strong> ${senderName} &lt;${senderEmail}&gt;</div>
+  <div><strong>Sent via:</strong> BAL Connect</div>
+  <div style="color:#777;font-size:11px;margin-top:4px;">Reply directly to this email — it will reach ${senderEmail}</div>
+</div>`.trim();
+
+    const textBanner =
+      `From: ${senderName} <${senderEmail}>\n` +
+      `Sent via: BAL Connect\n` +
+      `Reply directly to this email — it will reach ${senderEmail}\n` +
+      `${'-'.repeat(60)}\n\n`;
+
+    if (finalHtml) {
+      finalHtml = banner + finalHtml;
+    } else if (finalText) {
+      finalText = textBanner + finalText;
+    } else {
+      finalHtml = banner;
     }
   }
 
@@ -108,16 +149,16 @@ export async function sendEmail(options: SendEmailOptions): Promise<{ messageId:
     cc: options.cc ? (Array.isArray(options.cc) ? options.cc.join(', ') : options.cc) : undefined,
     bcc: options.bcc ? (Array.isArray(options.bcc) ? options.bcc.join(', ') : options.bcc) : undefined,
     subject: options.subject,
-    text: options.text,
-    html: options.html,
-    replyTo,
+    text: finalText,
+    html: finalHtml,
+    replyTo: options.replyTo,
     attachments: options.attachments,
   });
 
-  console.log(`[EMAIL] Sent via ${useStalwart ? 'Stalwart' : 'Office 365'} from ${senderEmail || 'helpdesk'} to ${recipients.join(', ')}`);
+  console.log(`[EMAIL] Sent as ${senderEmail} to ${recipients.join(', ')}`);
   return { messageId: result.messageId, accepted: result.accepted as string[] };
 }
 
 export function getTransporter() {
-  return transporter;
+  return office365Transport || createUserStalwartTransport('admin', process.env.STALWART_SMTP_PASSWORD || '');
 }
