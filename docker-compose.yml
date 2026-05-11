@@ -139,6 +139,14 @@ services:
 
 volumes:
   postgres_data:
+    external: true
+    name: bal-connect_postgres_data
   redis_data:
+    external: true
+    name: bal-connect_redis_data
   stalwart_data:
+    external: true
+    name: bal-connect_stalwart_data
   app_data:
+    external: true
+    name: bal-connect_app_data

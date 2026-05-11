@@ -163,6 +163,137 @@ router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
+// POST /api/conversations/:id/members — Add member(s) to a group conversation
+const addMembersSchema = z.object({
+  memberIds: z.array(z.string().uuid()).min(1).max(20),
+});
+
+router.post('/:id/members', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    const convId = String(req.params.id);
+    const userId = req.user!.userId;
+    const input = addMembersSchema.parse(req.body);
+
+    // Verify conversation exists and is a group
+    const convCheck = await client.query(
+      'SELECT id, type, name FROM conversations WHERE id = $1',
+      [convId]
+    );
+    if (convCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    if (convCheck.rows[0].type !== 'group') {
+      return res.status(400).json({ error: 'Can only add members to group conversations' });
+    }
+
+    // Verify requester is a member
+    const memberCheck = await client.query(
+      'SELECT role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
+      [convId, userId]
+    );
+    if (memberCheck.rows.length === 0 && req.user!.role !== 'admin') {
+      return res.status(403).json({ error: 'Not a member of this conversation' });
+    }
+
+    await client.query('BEGIN');
+
+    const addedUsers: { id: string; display_name: string }[] = [];
+
+    for (const memberId of input.memberIds) {
+      // Skip if already a member
+      const exists = await client.query(
+        'SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
+        [convId, memberId]
+      );
+      if (exists.rows.length > 0) continue;
+
+      // Add the member
+      await client.query(
+        `INSERT INTO conversation_members (conversation_id, user_id, role)
+         VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`,
+        [convId, memberId]
+      );
+
+      // Get user info for the system message
+      const userInfo = await client.query(
+        'SELECT id, display_name FROM users WHERE id = $1',
+        [memberId]
+      );
+      if (userInfo.rows.length > 0) {
+        addedUsers.push(userInfo.rows[0]);
+      }
+    }
+
+    if (addedUsers.length === 0) {
+      await client.query('COMMIT');
+      return res.json({ added: 0, message: 'All users are already members' });
+    }
+
+    // Get adder's name
+    const adderInfo = await client.query(
+      'SELECT display_name FROM users WHERE id = $1',
+      [userId]
+    );
+    const adderName = adderInfo.rows[0]?.display_name || 'Someone';
+
+    // Add system message
+    const names = addedUsers.map((u) => u.display_name).join(', ');
+    await client.query(
+      `INSERT INTO messages (conversation_id, sender_id, type, content, sequence_number)
+       VALUES ($1, $2, 'system', $3, allocate_sequence_number($1))`,
+      [convId, userId, `${adderName} added ${names} to the group`]
+    );
+
+    // Update conversation timestamp
+    await client.query(
+      'UPDATE conversations SET last_message_at = NOW() WHERE id = $1',
+      [convId]
+    );
+
+    await client.query('COMMIT');
+
+    // Fetch updated members list
+    const membersResult = await client.query(
+      `SELECT u.id as user_id, u.username, u.display_name, u.avatar_url, u.status, cm.role
+       FROM conversation_members cm
+       JOIN users u ON cm.user_id = u.id
+       WHERE cm.conversation_id = $1`,
+      [convId]
+    );
+
+    // Notify via Socket.IO so all clients update in real time
+    const io = (req as any).app?.get?.('io');
+    if (io) {
+      // Notify existing members about the new addition
+      io.to(`conversation:${convId}`).emit('conversation:members-updated', {
+        conversationId: convId,
+        members: membersResult.rows,
+        memberCount: membersResult.rows.length,
+      });
+
+      // Notify each newly added user so they see the conversation
+      for (const added of addedUsers) {
+        io.to(`user:${added.id}`).emit('conversation:added', { conversationId: convId });
+      }
+    }
+
+    res.json({
+      added: addedUsers.length,
+      members: membersResult.rows,
+      memberCount: membersResult.rows.length,
+    });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    if (err instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Validation failed', details: err.errors });
+    }
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ============================================
 // MESSAGES
 // ============================================

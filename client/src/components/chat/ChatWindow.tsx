@@ -15,6 +15,7 @@ import api from '@/services/api';
 import MessageList from './MessageList';
 import MessageInput from './MessageInput';
 import CallDialog from '@/components/calls/CallDialog';
+import AddMemberModal from './AddMemberModal';
 import type { Conversation } from '@/types';
 
 export default function ChatWindow() {
@@ -388,6 +389,26 @@ export default function ChatWindow() {
 
 /* ============ Members Side Panel ============ */
 function MembersPanel({ conversation: conv, onClose }: { conversation: Conversation; onClose: () => void }) {
+  const [showAddModal, setShowAddModal] = useState(false);
+  const { updateConversation, fetchConversations } = useChatStore();
+
+  const handleMembersAdded = (members: any[], memberCount: number) => {
+    // Update the active conversation's member list in real time
+    updateConversation(conv.id, {
+      members: members.map((m: any) => ({
+        user_id: m.user_id,
+        username: m.username,
+        display_name: m.display_name,
+        avatar_url: m.avatar_url,
+        role: m.role,
+        status: m.status,
+      })),
+      member_count: memberCount,
+    });
+    // Also refresh conversations list to get updated member counts
+    fetchConversations();
+  };
+
   return (
     <div
       style={{
@@ -414,7 +435,7 @@ function MembersPanel({ conversation: conv, onClose }: { conversation: Conversat
         }}
       >
         <span style={{ fontSize: 14, fontWeight: 600, color: '#242424' }}>
-          Members ({conv.member_count || 0})
+          Members ({conv.member_count || conv.members?.length || 0})
         </span>
         <button
           onClick={onClose}
@@ -426,30 +447,33 @@ function MembersPanel({ conversation: conv, onClose }: { conversation: Conversat
         </button>
       </div>
 
-      {/* Add member button */}
-      <div style={{ padding: '12px 16px', borderBottom: '1px solid #EDEBE9' }}>
-        <button
-          style={{
-            width: '100%',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            padding: '8px 12px',
-            borderRadius: 6,
-            border: '1px dashed #C8C6C4',
-            background: 'transparent',
-            cursor: 'pointer',
-            color: '#6264A7',
-            fontSize: 13,
-            fontWeight: 500,
-          }}
-          onMouseEnter={(e) => { e.currentTarget.style.background = '#F0F0FA'; }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-        >
-          <UserPlus size={16} />
-          Add member
-        </button>
-      </div>
+      {/* Add member button — only for group conversations */}
+      {conv.type === 'group' && (
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid #EDEBE9' }}>
+          <button
+            onClick={() => setShowAddModal(true)}
+            style={{
+              width: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: '8px 12px',
+              borderRadius: 6,
+              border: '1px dashed #C8C6C4',
+              background: 'transparent',
+              cursor: 'pointer',
+              color: '#6264A7',
+              fontSize: 13,
+              fontWeight: 500,
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = '#F0F0FA'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+          >
+            <UserPlus size={16} />
+            Add member
+          </button>
+        </div>
+      )}
 
       {/* Members list */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
@@ -487,7 +511,7 @@ function MembersPanel({ conversation: conv, onClose }: { conversation: Conversat
                   {member.display_name}
                 </div>
                 <div style={{ fontSize: 11, color: '#A19F9D' }}>
-                  {member.role === 'admin' ? 'Admin' : 'Member'}
+                  {member.role === 'owner' ? 'Owner' : member.role === 'admin' ? 'Admin' : 'Member'}
                   {member.status === 'online' && (
                     <span style={{ color: '#6BB700', marginLeft: 6 }}> Online</span>
                   )}
@@ -501,6 +525,15 @@ function MembersPanel({ conversation: conv, onClose }: { conversation: Conversat
           </div>
         )}
       </div>
+
+      {/* Add Member Modal */}
+      {showAddModal && (
+        <AddMemberModal
+          conversation={conv}
+          onClose={() => setShowAddModal(false)}
+          onMembersAdded={handleMembersAdded}
+        />
+      )}
     </div>
   );
 }
