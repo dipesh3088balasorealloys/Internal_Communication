@@ -21,6 +21,7 @@
     "imapflow": "^1.2.18",
     "ioredis": "^5.4.0",
     "jsonwebtoken": "^9.0.2",
+    "livekit-server-sdk": "^2.15.2",
     "mailparser": "^3.9.6",
     "md5": "^2.3.0",
     "morgan": "^1.10.0",

@@ -1,8 +1,12 @@
 import { Router, Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth';
 import { query } from '../../database/connection';
+import groupCallRoutes from './group-call.routes';
 
 const router = Router();
+
+// Mount group call sub-router at /api/calls/group/*
+router.use('/group', groupCallRoutes);
 
 // GET /api/calls/history — Get user's call history from system messages
 router.get('/history', authMiddleware, async (req: AuthRequest, res: Response) => {

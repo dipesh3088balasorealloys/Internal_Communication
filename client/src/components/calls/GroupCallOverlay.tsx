@@ -1,471 +1,368 @@
+/**
+ * GroupCallOverlay — Teams/Meet-style group call UI backed by LiveKit SFU.
+ *
+ * Renders only when `callStore.groupCall.isActive && groupCall.livekitToken` is set.
+ * Hands media routing entirely to LiveKit's React SDK (`<LiveKitRoom>`) — we keep
+ * the BAL Connect look (purple theme, Lucide icons) but reuse the battle-tested
+ * SFU primitives for grid layout, mute toggles, active speaker, screen share.
+ */
+
 import { useEffect, useRef, useState } from 'react';
 import {
-  PhoneOff, Mic, MicOff, Video, VideoOff,
-  Monitor, MonitorOff, Maximize2, Minimize2,
-  Users, UserCheck, UserX,
-} from 'lucide-react';
+  LiveKitRoom,
+  GridLayout,
+  ParticipantTile,
+  ControlBar,
+  useTracks,
+  useParticipants,
+  useLocalParticipant,
+  RoomAudioRenderer,
+  ConnectionStateToast,
+} from '@livekit/components-react';
+import { Track, RoomEvent, type DisconnectReason } from 'livekit-client';
+import '@livekit/components-styles';
+import { PhoneOff, Users, Minimize2, Maximize2 } from 'lucide-react';
 import { useCallStore } from '@/stores/callStore';
-import type { GroupCallParticipant } from '@/stores/callStore';
-
-const AVATAR_COLORS = [
-  '#6264A7', '#0078D4', '#038387', '#8764B8',
-  '#CA5010', '#498205', '#DA3B01', '#005B70',
-  '#C239B3', '#69797E', '#7A7574', '#0099BC',
-];
-
-function getAvatarColor(name: string): string {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-}
-
-function getGridCols(count: number): number {
-  if (count <= 1) return 1;
-  if (count <= 4) return 2;
-  if (count <= 9) return 3;
-  return 3;
-}
+import * as livekitApi from '@/services/livekit';
 
 export default function GroupCallOverlay() {
-  const {
-    groupCall, leaveGroupCall, toggleMute, toggleVideo,
-    startScreenShare, stopScreenShare, isScreenSharing, currentCall,
-  } = useCallStore();
-  const [isExpanded, setIsExpanded] = useState(true);
-  const [showParticipants, setShowParticipants] = useState(false);
-  const [duration, setDuration] = useState('00:00');
-  const [hoveredBtn, setHoveredBtn] = useState<string | null>(null);
-  const [isMuted, setIsMuted] = useState(false);
-  const [isVideoOn, setIsVideoOn] = useState(false);
+  const { groupCall, endGroupCall } = useCallStore();
 
-  // Timer
+  // Only mount when we have a token (i.e. we're actually in a LiveKit room)
+  if (!groupCall?.isActive || !groupCall.livekitToken || !groupCall.livekitWsUrl) {
+    return null;
+  }
+
+  return (
+    <LiveKitRoom
+      serverUrl={groupCall.livekitWsUrl}
+      token={groupCall.livekitToken}
+      connect={true}
+      video={groupCall.callType === 'video'}
+      audio={true}
+      onDisconnected={(reason?: DisconnectReason) => {
+        console.log('[LiveKit] Disconnected:', reason);
+        endGroupCall();
+      }}
+      onError={(err) => {
+        console.error('[LiveKit] Connection error:', err);
+      }}
+      style={{ height: '100vh' }}
+      data-lk-theme="default"
+    >
+      <RoomAudioRenderer />
+      <ConnectionStateToast />
+      <GroupCallContent />
+    </LiveKitRoom>
+  );
+}
+
+function GroupCallContent() {
+  const { groupCall, leaveGroupCall, endGroupCallForAll } = useCallStore();
+  const [isExpanded, setIsExpanded] = useState(true);
+  const [duration, setDuration] = useState('00:00');
+  const [showParticipantsPanel, setShowParticipantsPanel] = useState(false);
+  const startTimeRef = useRef(groupCall?.startTime ?? new Date());
+
+  // Duration timer
   useEffect(() => {
-    if (!groupCall?.startTime) return;
     const interval = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - groupCall.startTime!.getTime()) / 1000);
+      const elapsed = Math.floor((Date.now() - startTimeRef.current.getTime()) / 1000);
       const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
       const secs = (elapsed % 60).toString().padStart(2, '0');
       setDuration(`${mins}:${secs}`);
     }, 1000);
     return () => clearInterval(interval);
-  }, [groupCall?.startTime]);
+  }, []);
 
-  useEffect(() => {
-    if (groupCall) {
-      setIsVideoOn(groupCall.callType === 'video');
-    }
-  }, [groupCall?.callType]);
+  // Get all tracks (camera + screen share) for grid
+  const tracks = useTracks(
+    [
+      { source: Track.Source.Camera, withPlaceholder: true },
+      { source: Track.Source.ScreenShare, withPlaceholder: false },
+    ],
+    { onlySubscribed: false },
+  );
 
-  if (!groupCall?.isActive) return null;
+  const participants = useParticipants();
+  const participantCount = participants.length;
+  const isHost = !!groupCall?.isHost;
 
-  const participants = groupCall.participants || [];
-  const connectedCount = participants.filter(p => p.status === 'connected').length;
-  const groupName = groupCall.groupName || 'Group Call';
-
-  const handleToggleMute = () => {
-    if (currentCall) {
-      toggleMute(currentCall.id);
-    }
-    setIsMuted(!isMuted);
+  const handleLeave = async () => {
+    await leaveGroupCall();
   };
 
-  const handleToggleVideo = () => {
-    if (currentCall) {
-      toggleVideo(currentCall.id);
-    }
-    setIsVideoOn(!isVideoOn);
+  const handleEndForAll = async () => {
+    if (!confirm('End the call for everyone?')) return;
+    await endGroupCallForAll();
   };
 
-  const handleScreenShare = () => {
-    if (!currentCall) return;
-    if (isScreenSharing) {
-      stopScreenShare(currentCall.id);
-    } else {
-      startScreenShare(currentCall.id);
-    }
-  };
-
-  const handleLeave = () => {
-    if (currentCall) {
-      useCallStore.getState().hangup(currentCall.id);
-    }
-    leaveGroupCall();
-  };
-
-  // Minimized bar
+  // ─── Minimized bar ─────────────────────────────────────────────────────
   if (!isExpanded) {
     return (
       <div
         style={{
-          position: 'fixed', top: 0, left: 0, right: 0, zIndex: 90,
-          background: '#6BB700', color: '#fff',
-          padding: '8px 16px',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          position: 'fixed', bottom: 20, right: 20, zIndex: 9999,
+          background: '#1A1A2E', color: '#fff', borderRadius: 16,
+          padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12,
+          boxShadow: '0 10px 40px rgba(0,0,0,0.4)',
+          fontFamily: 'inherit',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div
-            style={{
-              width: 8, height: 8, background: '#fff', borderRadius: '50%',
-              animation: 'gcPulse 2s infinite',
-            }}
-          />
-          <Users size={16} />
-          <span style={{ fontSize: 14, fontWeight: 500 }}>{groupName}</span>
-          <span style={{ fontSize: 12, opacity: 0.8 }}>{connectedCount} participants</span>
-          <span style={{ fontSize: 12, opacity: 0.8 }}>{duration}</span>
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <span style={{ fontSize: 12, fontWeight: 700 }}>Group Call</span>
+          <span style={{ fontSize: 11, color: '#8B8CA7' }}>
+            {participantCount} {participantCount === 1 ? 'participant' : 'participants'} · {duration}
+          </span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button
-            onClick={() => setIsExpanded(true)}
-            style={{
-              padding: 6, borderRadius: 6, border: 'none',
-              background: 'transparent', color: '#fff', cursor: 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              transition: 'background 0.15s',
-            }}
-            onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.2)'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-          >
-            <Maximize2 size={16} />
-          </button>
-          <button
-            onClick={handleLeave}
-            style={{
-              padding: '4px 12px', borderRadius: 20, border: 'none',
-              background: '#D13438', color: '#fff', fontSize: 12, fontWeight: 500,
-              cursor: 'pointer', transition: 'background 0.15s',
-            }}
-            onMouseEnter={(e) => { e.currentTarget.style.background = '#C41E24'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.background = '#D13438'; }}
-          >
-            Leave
-          </button>
-        </div>
-        <style>{`@keyframes gcPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }`}</style>
+        <button
+          onClick={() => setIsExpanded(true)}
+          title="Expand"
+          style={iconBtnStyle('#3A3A55')}
+        >
+          <Maximize2 size={14} />
+        </button>
+        <button
+          onClick={handleLeave}
+          title="Leave"
+          style={iconBtnStyle('#DC2626')}
+        >
+          <PhoneOff size={14} />
+        </button>
       </div>
     );
   }
 
-  const gridCols = getGridCols(participants.length);
-
+  // ─── Expanded full-screen overlay ──────────────────────────────────────
   return (
     <div
       style={{
-        position: 'fixed', inset: 0, zIndex: 90,
-        background: '#1A1A2E',
+        position: 'fixed', inset: 0, zIndex: 9999,
+        background: '#0F0F1F',
         display: 'flex', flexDirection: 'column',
+        fontFamily: 'inherit',
       }}
     >
-      {/* Header */}
+      {/* Top bar */}
       <div
         style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: '16px 24px',
-          background: 'rgba(0,0,0,0.3)',
-          flexShrink: 0,
+          padding: '12px 20px', borderBottom: '1px solid #2A2A45',
+          color: '#fff', flexShrink: 0,
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <Users size={20} color="rgba(255,255,255,0.7)" />
+          <div style={{
+            width: 10, height: 10, borderRadius: '50%', background: '#16A34A',
+            boxShadow: '0 0 8px #16A34A',
+          }} />
           <div>
-            <h3 style={{ color: '#fff', fontWeight: 600, fontSize: 18, margin: 0 }}>{groupName}</h3>
-            <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 13, margin: '2px 0 0 0' }}>
-              {duration} • {connectedCount} participant{connectedCount !== 1 ? 's' : ''} • {isVideoOn ? 'Video' : 'Audio'} Call
+            <p style={{ fontSize: 14, fontWeight: 700, margin: 0 }}>
+              {groupCall?.callType === 'video' ? 'Group Video Call' : 'Group Audio Call'}
+            </p>
+            <p style={{ fontSize: 11, color: '#8B8CA7', margin: 0 }}>
+              {duration} · {participantCount} {participantCount === 1 ? 'participant' : 'participants'}
+              {isHost && <span style={{ marginLeft: 8, padding: '1px 6px', background: '#6264A7', borderRadius: 4, fontSize: 10 }}>HOST</span>}
             </p>
           </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+
+        <div style={{ display: 'flex', gap: 8 }}>
           <button
-            onClick={() => setShowParticipants(!showParticipants)}
-            onMouseEnter={() => setHoveredBtn('participants')}
-            onMouseLeave={() => setHoveredBtn(null)}
-            style={{
-              padding: '6px 12px', borderRadius: 8, border: 'none',
-              background: showParticipants ? 'rgba(255,255,255,0.2)' : hoveredBtn === 'participants' ? 'rgba(255,255,255,0.1)' : 'transparent',
-              color: '#fff', cursor: 'pointer', fontSize: 12, fontWeight: 500,
-              display: 'flex', alignItems: 'center', gap: 6,
-              transition: 'background 0.15s',
-            }}
+            onClick={() => setShowParticipantsPanel(!showParticipantsPanel)}
+            style={topBarBtnStyle(showParticipantsPanel)}
+            title="Participants"
           >
-            <Users size={14} /> {connectedCount}
+            <Users size={14} /> {participantCount}
           </button>
-          <button
-            onClick={() => setIsExpanded(false)}
-            onMouseEnter={() => setHoveredBtn('minimize')}
-            onMouseLeave={() => setHoveredBtn(null)}
-            style={{
-              padding: 8, borderRadius: 8, border: 'none',
-              background: hoveredBtn === 'minimize' ? 'rgba(255,255,255,0.1)' : 'transparent',
-              color: 'rgba(255,255,255,0.7)', cursor: 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              transition: 'all 0.15s',
-            }}
-          >
-            <Minimize2 size={20} />
+          <button onClick={() => setIsExpanded(false)} style={topBarBtnStyle(false)} title="Minimize">
+            <Minimize2 size={14} />
           </button>
         </div>
       </div>
 
-      {/* Main area */}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {/* Participant grid */}
-        <div
-          style={{
-            flex: 1, padding: 12, overflow: 'auto',
-            display: 'grid',
-            gridTemplateColumns: `repeat(${gridCols}, 1fr)`,
-            gap: 8,
-            alignContent: participants.length <= 4 ? 'center' : 'start',
-          }}
-        >
-          {participants.length === 0 ? (
-            <div style={{
-              gridColumn: '1 / -1',
-              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-              color: 'rgba(255,255,255,0.5)', gap: 12, padding: 40,
-            }}>
-              <Users size={48} />
-              <p style={{ fontSize: 16, margin: 0 }}>Waiting for participants to join...</p>
-            </div>
-          ) : (
-            participants.map((p) => (
-              <ParticipantTile key={p.userId} participant={p} isVideo={isVideoOn} />
-            ))
-          )}
+      {/* Main area: grid + optional participants panel */}
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        {/* Grid */}
+        <div style={{ flex: 1, padding: 16, minWidth: 0 }}>
+          <GridLayout tracks={tracks} style={{ height: '100%' }}>
+            <ParticipantTile />
+          </GridLayout>
         </div>
 
-        {/* Participants sidebar */}
-        {showParticipants && (
-          <div
-            style={{
-              width: 260, minWidth: 260, borderLeft: '1px solid rgba(255,255,255,0.1)',
-              background: 'rgba(0,0,0,0.2)', overflowY: 'auto',
-              display: 'flex', flexDirection: 'column',
-            }}
-          >
-            <div style={{ padding: '16px', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-              <h4 style={{ color: '#fff', fontSize: 14, fontWeight: 600, margin: 0 }}>
-                Participants ({participants.length})
-              </h4>
-            </div>
-            {participants.map((p) => {
-              const color = getAvatarColor(p.displayName);
-              const statusIcon = p.status === 'connected'
-                ? <UserCheck size={12} color="#6BB700" />
-                : p.status === 'ringing'
-                  ? <span style={{ fontSize: 10, color: '#FFAA44' }}>Ringing...</span>
-                  : <UserX size={12} color="#D13438" />;
-              return (
-                <div
-                  key={p.userId}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 10,
-                    padding: '10px 16px',
-                  }}
-                >
-                  <div
-                    style={{
-                      width: 32, height: 32, borderRadius: '50%',
-                      background: color, color: '#fff',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontSize: 13, fontWeight: 600, flexShrink: 0,
-                    }}
-                  >
-                    {p.displayName[0]?.toUpperCase() || '?'}
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 500, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {p.displayName}
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                      {statusIcon}
-                      {p.isMuted && <MicOff size={11} color="rgba(255,255,255,0.4)" />}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+        {/* Participants side panel (toggleable) */}
+        {showParticipantsPanel && (
+          <ParticipantsPanel isHost={isHost} callId={groupCall?.callId ?? null} />
         )}
       </div>
 
-      {/* Screen Sharing Banner */}
-      {isScreenSharing && (
-        <div style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-          padding: '8px 20px', background: '#6264A7', color: '#fff', flexShrink: 0,
-          fontSize: 13, fontWeight: 500,
-        }}>
-          <Monitor size={16} />
-          <span>You are sharing your screen with the group</span>
-          <button
-            onClick={handleScreenShare}
-            style={{ marginLeft: 10, padding: '4px 14px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.4)', background: 'rgba(255,255,255,0.15)', color: '#fff', cursor: 'pointer', fontSize: 12, fontWeight: 600 }}
-          >
-            Stop Sharing
-          </button>
-        </div>
-      )}
-
-      {/* Controls bar */}
+      {/* Bottom controls */}
       <div
         style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 16,
-          padding: '24px 0',
-          background: 'rgba(0,0,0,0.3)',
-          flexShrink: 0,
+          padding: '12px 20px', borderTop: '1px solid #2A2A45',
+          background: '#1A1A2E',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          flexShrink: 0, gap: 12,
         }}
       >
-        <GCButton
-          icon={isMuted ? <MicOff size={22} /> : <Mic size={22} />}
-          label={isMuted ? 'Unmute' : 'Mute'}
-          active={isMuted}
-          onClick={handleToggleMute}
-          id="mute"
-          hoveredBtn={hoveredBtn}
-          setHoveredBtn={setHoveredBtn}
-        />
-        <GCButton
-          icon={isVideoOn ? <Video size={22} /> : <VideoOff size={22} />}
-          label={isVideoOn ? 'Stop Video' : 'Start Video'}
-          active={!isVideoOn}
-          onClick={handleToggleVideo}
-          id="video"
-          hoveredBtn={hoveredBtn}
-          setHoveredBtn={setHoveredBtn}
-        />
-        <GCButton
-          icon={isScreenSharing ? <MonitorOff size={22} /> : <Monitor size={22} />}
-          label={isScreenSharing ? 'Stop Sharing' : 'Share Screen'}
-          active={isScreenSharing}
-          onClick={handleScreenShare}
-          id="screen"
-          hoveredBtn={hoveredBtn}
-          setHoveredBtn={setHoveredBtn}
-        />
-        {/* Leave button */}
-        <button
-          onClick={handleLeave}
-          onMouseEnter={() => setHoveredBtn('leave')}
-          onMouseLeave={() => setHoveredBtn(null)}
-          title="Leave Call"
-          style={{
-            width: 56, height: 56, borderRadius: '50%',
-            background: hoveredBtn === 'leave' ? '#C41E24' : '#D13438',
-            color: '#fff', border: 'none',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            cursor: 'pointer', transition: 'background 0.15s',
-            boxShadow: '0 4px 16px rgba(209,52,56,0.4)',
-          }}
-        >
-          <PhoneOff size={24} />
-        </button>
+        {/* LiveKit's built-in control bar (mute/camera/screen share/leave) */}
+        <div style={{ flex: 1 }}>
+          <ControlBar
+            variation="minimal"
+            controls={{
+              microphone: true,
+              camera: groupCall?.callType === 'video',
+              screenShare: true,
+              chat: false,
+              leave: false, // We render our own leave button (handles "end for all" host option)
+              settings: false,
+            }}
+          />
+        </div>
+
+        {/* Custom leave / end-for-all */}
+        <div style={{ display: 'flex', gap: 8 }}>
+          {isHost && (
+            <button onClick={handleEndForAll} style={endForAllBtnStyle}>
+              End for all
+            </button>
+          )}
+          <button onClick={handleLeave} style={leaveBtnStyle} title="Leave call">
+            <PhoneOff size={16} />
+            <span style={{ fontWeight: 600 }}>Leave</span>
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
-function ParticipantTile({ participant: p, isVideo }: { participant: GroupCallParticipant; isVideo: boolean }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const color = getAvatarColor(p.displayName);
+// ─── Participants side panel ──────────────────────────────────────────────
+function ParticipantsPanel({ isHost, callId }: { isHost: boolean; callId: string | null }) {
+  const participants = useParticipants();
+  const { localParticipant } = useLocalParticipant();
+  const [busyOnUser, setBusyOnUser] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (videoRef.current && p.stream) {
-      videoRef.current.srcObject = p.stream;
-    }
-  }, [p.stream]);
+  const handleKick = async (identity: string) => {
+    if (!callId || !isHost || identity === localParticipant.identity) return;
+    if (!confirm(`Remove ${identity} from the call?`)) return;
+    setBusyOnUser(identity);
+    try { await livekitApi.kickGroupParticipant(callId, identity); }
+    catch (err: any) { alert('Kick failed: ' + (err?.response?.data?.error || err.message)); }
+    finally { setBusyOnUser(null); }
+  };
+
+  const handleMuteOther = async (identity: string, isMuted: boolean) => {
+    if (!callId || !isHost || identity === localParticipant.identity) return;
+    setBusyOnUser(identity);
+    try { await livekitApi.muteGroupParticipant(callId, identity, !isMuted); }
+    catch (err: any) { alert('Mute failed: ' + (err?.response?.data?.error || err.message)); }
+    finally { setBusyOnUser(null); }
+  };
 
   return (
     <div
       style={{
-        position: 'relative',
-        borderRadius: 12,
-        overflow: 'hidden',
-        background: '#252540',
-        aspectRatio: isVideo ? '16/9' : '1',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        border: p.status === 'connected' ? '2px solid rgba(255,255,255,0.1)' : '2px solid rgba(255,255,255,0.05)',
-        minHeight: isVideo ? 160 : 120,
+        width: 280, flexShrink: 0,
+        background: '#1A1A2E', borderLeft: '1px solid #2A2A45',
+        padding: 16, overflowY: 'auto',
+        color: '#fff',
       }}
     >
-      {isVideo && p.stream ? (
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted={p.userId === 'self'}
-          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-        />
-      ) : (
-        <div style={{ textAlign: 'center' }}>
+      <h3 style={{ fontSize: 13, fontWeight: 700, color: '#fff', margin: '0 0 12px 0' }}>
+        Participants ({participants.length})
+      </h3>
+      {participants.map((p) => {
+        const isLocal = p.identity === localParticipant.identity;
+        const audioPub = p.getTrackPublication(Track.Source.Microphone);
+        const isMuted = !!audioPub?.isMuted;
+        const busy = busyOnUser === p.identity;
+        return (
           <div
+            key={p.identity}
             style={{
-              width: 64, height: 64, borderRadius: '50%',
-              background: color, color: '#fff',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 24, fontWeight: 700, margin: '0 auto',
-              boxShadow: p.status === 'connected' ? `0 0 0 3px rgba(255,255,255,0.1)` : 'none',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '8px 10px', borderRadius: 8,
+              background: 'rgba(255,255,255,0.04)', marginBottom: 6,
+              fontSize: 12,
             }}
           >
-            {p.displayName[0]?.toUpperCase() || '?'}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 1 }}>
+              <div style={{
+                width: 28, height: 28, borderRadius: '50%',
+                background: '#6264A7', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 11, fontWeight: 700, flexShrink: 0,
+              }}>
+                {(p.name || p.identity || '?').charAt(0).toUpperCase()}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <p style={{ margin: 0, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {p.name || p.identity}
+                  {isLocal && <span style={{ color: '#8B8CA7', fontWeight: 400 }}> (you)</span>}
+                </p>
+                <p style={{ margin: 0, fontSize: 10, color: '#8B8CA7' }}>
+                  {isMuted ? 'Muted' : 'Speaking-allowed'}
+                </p>
+              </div>
+            </div>
+            {isHost && !isLocal && (
+              <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                <button
+                  onClick={() => handleMuteOther(p.identity, isMuted)}
+                  disabled={busy}
+                  style={participantActionBtnStyle('#D97706')}
+                  title={isMuted ? 'Unmute' : 'Mute'}
+                >
+                  {isMuted ? 'Unmute' : 'Mute'}
+                </button>
+                <button
+                  onClick={() => handleKick(p.identity)}
+                  disabled={busy}
+                  style={participantActionBtnStyle('#DC2626')}
+                  title="Remove from call"
+                >
+                  Remove
+                </button>
+              </div>
+            )}
           </div>
-        </div>
-      )}
-
-      {/* Name overlay at bottom */}
-      <div
-        style={{
-          position: 'absolute', bottom: 0, left: 0, right: 0,
-          padding: '6px 10px',
-          background: 'linear-gradient(transparent, rgba(0,0,0,0.6))',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        }}
-      >
-        <span style={{ fontSize: 12, fontWeight: 500, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {p.displayName}
-        </span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          {p.isMuted && <MicOff size={12} color="rgba(255,255,255,0.7)" />}
-          {p.status === 'ringing' && (
-            <span style={{ fontSize: 10, color: '#FFAA44' }}>Ringing</span>
-          )}
-          {p.status === 'disconnected' && (
-            <span style={{ fontSize: 10, color: '#D13438' }}>Left</span>
-          )}
-        </div>
-      </div>
+        );
+      })}
     </div>
   );
 }
 
-function GCButton({
-  icon, label, active, onClick, id, hoveredBtn, setHoveredBtn,
-}: {
-  icon: React.ReactNode; label: string; active: boolean; onClick: () => void;
-  id: string; hoveredBtn: string | null; setHoveredBtn: (id: string | null) => void;
-}) {
-  const isHovered = hoveredBtn === id;
-  return (
-    <button
-      onClick={onClick}
-      onMouseEnter={() => setHoveredBtn(id)}
-      onMouseLeave={() => setHoveredBtn(null)}
-      title={label}
-      style={{
-        width: 48, height: 48, borderRadius: '50%',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        border: 'none', cursor: 'pointer',
-        transition: 'background 0.15s',
-        color: active ? '#fff' : 'rgba(255,255,255,0.8)',
-        background: active
-          ? 'rgba(255,255,255,0.3)'
-          : isHovered ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.1)',
-      }}
-    >
-      {icon}
-    </button>
-  );
-}
+// ─── Style helpers ────────────────────────────────────────────────────────
+const iconBtnStyle = (bg: string): React.CSSProperties => ({
+  width: 32, height: 32, borderRadius: '50%',
+  background: bg, color: '#fff', border: 'none',
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  cursor: 'pointer',
+});
+
+const topBarBtnStyle = (active: boolean): React.CSSProperties => ({
+  display: 'flex', alignItems: 'center', gap: 4,
+  padding: '6px 10px', borderRadius: 8,
+  background: active ? '#6264A7' : '#2A2A45',
+  color: '#fff', border: 'none', cursor: 'pointer',
+  fontSize: 11, fontWeight: 600, fontFamily: 'inherit',
+});
+
+const leaveBtnStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 6,
+  padding: '8px 16px', borderRadius: 24,
+  background: '#DC2626', color: '#fff', border: 'none',
+  cursor: 'pointer', fontFamily: 'inherit',
+};
+
+const endForAllBtnStyle: React.CSSProperties = {
+  padding: '8px 14px', borderRadius: 24,
+  background: 'transparent', color: '#FECACA', border: '1px solid #DC2626',
+  cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, fontWeight: 600,
+};
+
+const participantActionBtnStyle = (color: string): React.CSSProperties => ({
+  padding: '4px 8px', borderRadius: 6,
+  background: 'transparent', color, border: `1px solid ${color}`,
+  cursor: 'pointer', fontFamily: 'inherit', fontSize: 10, fontWeight: 600,
+});

@@ -5,8 +5,11 @@ import {
   RefreshCw, Clock, Database, Server,
   CheckCircle, XCircle, AlertTriangle, PhoneCall,
   Link, Unlink, Loader, X, Eye, Paperclip, Image, Download,
+  UserPlus,
 } from 'lucide-react';
 import api from '@/services/api';
+import MailAccountSection, { MailStatusBadge } from './MailAccountSection';
+import OnboardTab from './OnboardTab';
 
 interface DashboardStats {
   users: { total: number; online: number };
@@ -22,11 +25,12 @@ interface SystemHealth {
   checks: Record<string, any>;
 }
 
-type Tab = 'overview' | 'users' | 'extensions' | 'conversations' | 'search' | 'health';
+type Tab = 'overview' | 'users' | 'onboard' | 'extensions' | 'conversations' | 'search' | 'health';
 
 const TAB_LIST: { key: Tab; label: string; icon: React.ReactNode }[] = [
   { key: 'overview', label: 'Overview', icon: <Activity size={15} /> },
   { key: 'users', label: 'Users', icon: <Users size={15} /> },
+  { key: 'onboard', label: 'Onboard', icon: <UserPlus size={15} /> },
   { key: 'extensions', label: 'Extensions', icon: <PhoneCall size={15} /> },
   { key: 'conversations', label: 'Conversations', icon: <MessageSquare size={15} /> },
   { key: 'search', label: 'Search', icon: <Search size={15} /> },
@@ -199,6 +203,7 @@ export default function AdminDashboard() {
       <div style={{ flex: 1, overflowY: 'auto', padding: 24, background: '#F8F9FC' }}>
         {activeTab === 'overview' && stats && <OverviewTab stats={stats} analytics={analytics} />}
         {activeTab === 'users' && <UsersTab users={users} onRefresh={loadUsers} />}
+        {activeTab === 'onboard' && <OnboardTab />}
         {activeTab === 'extensions' && <ExtensionsTab extensions={ucmExtensions} users={allUsers} onRefresh={loadExtensions} loading={extensionsLoading} error={extensionsError} />}
         {activeTab === 'conversations' && <ConversationsTab conversations={conversations} />}
         {activeTab === 'search' && <SearchTab query={searchQuery} onQueryChange={setSearchQuery} onSearch={handleSearch} results={searchResults} />}
@@ -593,6 +598,7 @@ function UsersTab({ users, onRefresh }: { users: any[]; onRefresh: () => void })
                   <th style={thStyle}>Role</th>
                   <th style={thStyle}>Department</th>
                   <th style={thStyle}>SIP Ext.</th>
+                  <th style={thStyle}>Mail</th>
                   <th style={thStyle}>Messages</th>
                   <th style={thStyle}>Status</th>
                 </tr>
@@ -626,6 +632,7 @@ function UsersTab({ users, onRefresh }: { users: any[]; onRefresh: () => void })
                     </td>
                     <td style={tdStyle}>{user.department || <span style={{ color: '#C0C1D4' }}>—</span>}</td>
                     <td style={{ ...tdStyle, fontFamily: 'monospace', fontSize: 12 }}>{user.sip_extension || <span style={{ color: '#C0C1D4' }}>—</span>}</td>
+                    <td style={tdStyle}><MailStatusBadge status={user.mail_status} /></td>
                     <td style={{ ...tdStyle, fontWeight: 600 }}>{user.message_count ?? 0}</td>
                     <td style={tdStyle}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -722,6 +729,16 @@ function UsersTab({ users, onRefresh }: { users: any[]; onRefresh: () => void })
             <p style={{ fontSize: 11, color: '#A0A1BC', margin: '0 0 16px 0' }}>
               Last seen: {selectedUser.last_seen ? new Date(selectedUser.last_seen).toLocaleString() : 'Never'}
             </p>
+
+            {/* Mail Account (Stalwart) */}
+            <MailAccountSection
+              user={selectedUser}
+              onChanged={(status) => {
+                // Reflect the new status in the parent list + selection
+                setSelectedUser((prev: any) => prev ? { ...prev, mail_status: status } : prev);
+                onRefresh();
+              }}
+            />
 
             {/* Actions */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

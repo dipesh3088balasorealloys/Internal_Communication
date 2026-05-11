@@ -150,11 +150,11 @@ export default function ChatWindow() {
       }
       useCallStore.getState().makeCall(targetUserId, type, conv.other_user?.display_name || conv.other_user?.username, conv.id);
     } else {
-      // Group call — emit socket event
-      const socket = getSocket();
+      // Group call — backend mints LiveKit token and rings everyone via socket
       const groupName = conv.name || 'Group Call';
-      socket?.emit('group-call:start', { conversationId: conv.id, callType: type, groupName });
-      useCallStore.getState().startGroupCall(conv.id, type, groupName);
+      useCallStore.getState().startGroupCall(conv.id, type, groupName).catch((err) => {
+        console.error('[ChatWindow] startGroupCall failed:', err);
+      });
     }
   };
 

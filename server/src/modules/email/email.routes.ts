@@ -5,7 +5,7 @@ import fs from 'fs';
 import { randomUUID } from 'crypto';
 import { authMiddleware, AuthRequest } from '../../middleware/auth';
 import { query } from '../../database/connection';
-import { sendEmail } from './email.service';
+import { sendEmail, resolveUserMailCredential } from './email.service';
 import { fetchEmails, testImapConnection, fetchImapAttachment } from './imap.service';
 
 const EMAIL_ATTACH_DIR = path.resolve(process.env.UPLOAD_DIR || '../data', 'email-attachments');
@@ -47,11 +47,11 @@ router.post('/send', emailUpload.array('attachments', 10), async (req: AuthReque
       return res.status(400).json({ error: 'Subject is required' });
     }
 
-    // Get sender's email, name, and mail_password from DB
-    const senderResult = await query('SELECT email, display_name, mail_password FROM users WHERE id = $1', [req.user!.userId]);
-    const senderEmail = senderResult.rows[0]?.email || '';
-    const senderName = senderResult.rows[0]?.display_name || 'BAL Connect';
-    const mailPassword = senderResult.rows[0]?.mail_password || '';
+    // Get sender's email, name, and mail_password (encrypted preferred, plaintext fallback)
+    const sender = await resolveUserMailCredential(req.user!.userId);
+    const senderEmail = sender.email;
+    const senderName = sender.displayName;
+    const mailPassword = sender.mailPassword;
 
     // All emails sent directly through Stalwart as the actual sender
     let finalHtml = html || undefined;
@@ -273,9 +273,9 @@ router.get('/imap-attachment/:uid/:index', async (req: AuthRequest, res: Respons
   try {
     const uid = parseInt(req.params.uid as string);
     const index = parseInt(req.params.index as string);
-    const userResult = await query('SELECT email, mail_password FROM users WHERE id = $1', [req.user!.userId]);
-    const userLogin = (userResult.rows[0]?.email || '').split('@')[0];
-    const mailPass = userResult.rows[0]?.mail_password || '';
+    const cred = await resolveUserMailCredential(req.user!.userId);
+    const userLogin = cred.loginName;
+    const mailPass = cred.mailPassword;
 
     const att = await fetchImapAttachment(uid, index, userLogin, mailPass);
     if (!att) return res.status(404).json({ error: 'Attachment not found' });
@@ -327,10 +327,10 @@ router.get('/inbox', async (req: AuthRequest, res: Response) => {
   try {
     const { folder = 'INBOX', limit = '30' } = req.query;
     // Get the logged-in user's email + mail_password for per-user IMAP login
-    const userResult = await query('SELECT email, mail_password FROM users WHERE id = $1', [req.user!.userId]);
-    const userEmail = userResult.rows[0]?.email || '';
-    const userMailPass = userResult.rows[0]?.mail_password || '';
-    const userLogin = userEmail.split('@')[0];
+    const cred = await resolveUserMailCredential(req.user!.userId);
+    const userEmail = cred.email;
+    const userMailPass = cred.mailPassword;
+    const userLogin = cred.loginName;
     const emails = await fetchEmails(folder as string, parseInt(limit as string), userLogin, userMailPass);
     res.json({ emails, total: emails.length, folder, account: userEmail });
   } catch (err: any) {

@@ -7,6 +7,8 @@ import https from 'https';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { ucmService } from '../../services/ucm.service';
+import * as stalwart from '../../services/stalwart.service';
+import { encryptSecret, generateMailPassword } from '../../utils/crypto';
 
 const router = Router();
 
@@ -84,6 +86,7 @@ router.get('/users', async (req: AuthRequest, res: Response) => {
     let sql = `
       SELECT id, username, email, display_name, avatar_url, role, department, designation,
              sip_extension, sip_password, status, status_message, is_active, last_seen, created_at,
+             mail_status, mail_assigned_at, mail_assigned_by, mail_last_test_at, mail_last_test_ok,
              (SELECT COUNT(*) FROM messages WHERE sender_id = users.id AND deleted_at IS NULL) as message_count,
              (SELECT COUNT(*) FROM files WHERE uploaded_by = users.id) as file_count
       FROM users WHERE 1=1
@@ -235,6 +238,576 @@ router.get('/dashboard/analytics', async (_req: AuthRequest, res: Response) => {
       recentCalls: recentCallsRes.rows,
       storage: { count: parseInt(storageRes.rows[0].count), totalBytes: parseInt(storageRes.rows[0].total_size) },
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// EMPLOYEE ONBOARDING (atomic)
+// ============================================
+
+const VALID_ROLES = new Set(['admin', 'manager', 'employee']);
+const USERNAME_PATTERN = /^[a-z0-9][a-z0-9._-]{2,49}$/;
+const EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+
+// GET /api/admin/users/check-availability?username=...&email=...
+// Real-time uniqueness check used by the Onboard wizard.
+router.get('/users/check-availability', async (req: AuthRequest, res: Response) => {
+  try {
+    const username = String(req.query.username || '').trim().toLowerCase();
+    const email = String(req.query.email || '').trim().toLowerCase();
+
+    const out: any = {
+      username: { available: true, reason: null as string | null },
+      email: { available: true, reason: null as string | null },
+    };
+
+    if (username) {
+      if (!USERNAME_PATTERN.test(username)) {
+        out.username = { available: false, reason: 'invalid' };
+      } else {
+        const r = await query('SELECT 1 FROM users WHERE username = $1 LIMIT 1', [username]);
+        if (r.rows.length > 0) out.username = { available: false, reason: 'taken' };
+      }
+    } else {
+      out.username = { available: false, reason: 'empty' };
+    }
+
+    if (email) {
+      if (!EMAIL_PATTERN.test(email)) {
+        out.email = { available: false, reason: 'invalid' };
+      } else {
+        const r = await query('SELECT 1 FROM users WHERE email = $1 LIMIT 1', [email]);
+        if (r.rows.length > 0) out.email = { available: false, reason: 'taken' };
+      }
+    } else {
+      out.email = { available: false, reason: 'empty' };
+    }
+
+    res.json(out);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/users/onboard — Atomic employee creation (user + optional mail)
+// Body shape:
+// {
+//   display_name, username, email, department, designation?, role,
+//   loginPassword: string,                              (admin-set)
+//   mail: { mode: 'create' | 'assign' | 'skip', existingPassword?, customEmail? }
+// }
+router.post('/users/onboard', async (req: AuthRequest, res: Response) => {
+  // ---- Validate input ----
+  const body = req.body || {};
+  const display_name = String(body.display_name || '').trim();
+  const username = String(body.username || '').trim().toLowerCase();
+  const email = String(body.email || '').trim().toLowerCase();
+  const department = body.department ? String(body.department).trim() : null;
+  const designation = body.designation ? String(body.designation).trim() : null;
+  const role = String(body.role || 'employee').trim();
+  const loginPassword = String(body.loginPassword || '');
+  const mail = body.mail || { mode: 'skip' };
+  const mailMode = mail.mode === 'create' || mail.mode === 'assign' ? mail.mode : 'skip';
+  const mailExistingPassword = mail.existingPassword ? String(mail.existingPassword) : '';
+  const mailCustomEmail = mail.customEmail ? String(mail.customEmail).trim().toLowerCase() : '';
+
+  if (!display_name) return res.status(400).json({ error: 'display_name is required' });
+  if (!username || !USERNAME_PATTERN.test(username)) {
+    return res.status(400).json({ error: 'username is required (3-50 chars, lowercase letters/digits/.-_)' });
+  }
+  if (!email || !EMAIL_PATTERN.test(email)) {
+    return res.status(400).json({ error: 'A valid email is required' });
+  }
+  if (!VALID_ROLES.has(role)) {
+    return res.status(400).json({ error: 'role must be admin / manager / employee' });
+  }
+  if (loginPassword.length < 8) {
+    return res.status(400).json({ error: 'Login password must be at least 8 characters' });
+  }
+  if (mailMode === 'assign' && !mailExistingPassword) {
+    return res.status(400).json({ error: 'Existing mail password required for assign mode' });
+  }
+
+  // ---- Pre-flight uniqueness check ----
+  try {
+    const dup = await query('SELECT 1 FROM users WHERE username = $1 OR email = $2 LIMIT 1', [username, email]);
+    if (dup.rows.length > 0) {
+      return res.status(409).json({ error: 'Username or email already in use' });
+    }
+  } catch (err: any) {
+    return res.status(500).json({ error: 'DB error: ' + err.message });
+  }
+
+  // ---- Begin transaction ----
+  const client = await pool.connect();
+  let createdUserId: string | null = null;
+  let createdStalwartLogin: string | null = null;
+
+  try {
+    await client.query('BEGIN');
+
+    // Hash login password
+    const loginHash = await bcrypt.hash(loginPassword, 12);
+
+    // Insert user. mail_status defaults to 'none' from schema.
+    const insertUser = await client.query(
+      `INSERT INTO users (
+         username, email, password_hash, display_name, department, designation, role
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, username, email, display_name, department, designation, role, created_at`,
+      [username, email, loginHash, display_name, department, designation, role],
+    );
+    const newUser = insertUser.rows[0];
+    createdUserId = newUser.id;
+
+    // ---- Mail account provisioning (optional) ----
+    let mailEmailFinal: string | null = null;
+    let mailGeneratedPassword: string | null = null;
+
+    if (mailMode !== 'skip') {
+      const mailLogin = (mailCustomEmail || email).split('@')[0]; // login = local part
+      const mailEmail = mailCustomEmail || email;
+      mailEmailFinal = mailEmail;
+
+      let mailPassword = '';
+      if (mailMode === 'create') {
+        // Refuse if Stalwart principal already exists
+        const existing = await stalwart.getPrincipal(mailLogin);
+        if (existing) {
+          throw new HttpError(409, `Stalwart principal "${mailLogin}" already exists. Use "Assign existing" instead.`);
+        }
+        mailPassword = generateMailPassword(12);
+        await stalwart.createPrincipal({
+          name: mailLogin,
+          password: mailPassword,
+          email: mailEmail,
+          description: display_name,
+        });
+        createdStalwartLogin = mailLogin;
+        mailGeneratedPassword = mailPassword;
+      } else {
+        // mode === 'assign'
+        mailPassword = mailExistingPassword;
+        const test = await stalwart.testCredentials(mailLogin, mailPassword);
+        if (!test.ok) {
+          throw new HttpError(400, 'Provided mail credentials failed IMAP login: ' + (test.error || 'unknown'));
+        }
+      }
+
+      const encrypted = encryptSecret(mailPassword);
+      await client.query(
+        `UPDATE users
+            SET mail_password_encrypted = $1,
+                mail_password = NULL,
+                mail_status = 'active',
+                mail_assigned_at = NOW(),
+                mail_assigned_by = $2,
+                mail_last_test_at = NOW(),
+                mail_last_test_ok = TRUE,
+                updated_at = NOW()
+          WHERE id = $3`,
+        [encrypted, req.user!.userId, newUser.id],
+      );
+    }
+
+    // ---- Audit log ----
+    await client.query(
+      `INSERT INTO admin_audit_logs (admin_user_id, target_user_id, action, details, ip_address)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        req.user!.userId,
+        newUser.id,
+        'user.onboarded',
+        {
+          username,
+          email,
+          role,
+          department,
+          mailMode,
+          mailEmail: mailEmailFinal,
+        },
+        Array.isArray(req.ip) ? req.ip[0] : req.ip || null,
+      ],
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`[Admin] Onboarded ${username} (mailMode=${mailMode})`);
+
+    return res.json({
+      ok: true,
+      user: newUser,
+      credentials: {
+        loginPassword,                         // echo back so admin can show in UI
+        mailEmail: mailEmailFinal,
+        mailPassword: mailGeneratedPassword,   // null if assign or skip
+      },
+    });
+  } catch (err: any) {
+    // Rollback DB
+    try { await client.query('ROLLBACK'); } catch { /* noop */ }
+
+    // Best-effort cleanup: if we created a Stalwart principal and DB rolled back,
+    // delete the orphan Stalwart principal so retries don't hit a 409.
+    if (createdStalwartLogin) {
+      try {
+        await stalwart.deletePrincipal(createdStalwartLogin);
+        console.warn(`[Admin] Cleaned up orphan Stalwart principal: ${createdStalwartLogin}`);
+      } catch (cleanupErr: any) {
+        console.error(`[Admin] Failed to clean up orphan Stalwart principal "${createdStalwartLogin}":`, cleanupErr.message);
+      }
+    }
+
+    const status = err instanceof HttpError ? err.status : 500;
+    const message = err.message || 'Onboarding failed';
+    console.error('[Admin] Onboard error:', message);
+    return res.status(status).json({ error: message });
+  } finally {
+    client.release();
+  }
+});
+
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) { super(message); this.status = status; }
+}
+
+// ============================================
+// MAIL ACCOUNT MANAGEMENT (Stalwart)
+// ============================================
+
+const MAIL_DOMAIN = process.env.STALWART_DOMAIN || 'balasorealloys.in';
+
+async function writeAuditLog(
+  adminUserId: string,
+  targetUserId: string | string[] | null | undefined,
+  action: string,
+  details: Record<string, any> = {},
+  ip?: string | string[] | undefined,
+) {
+  try {
+    const ipString = Array.isArray(ip) ? ip[0] : ip;
+    const targetIdString = Array.isArray(targetUserId) ? targetUserId[0] : targetUserId;
+    await query(
+      `INSERT INTO admin_audit_logs (admin_user_id, target_user_id, action, details, ip_address)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [adminUserId, targetIdString || null, action, details, ipString || null],
+    );
+  } catch (err: any) {
+    console.error('[Admin] Failed to write audit log:', err.message);
+  }
+}
+
+/**
+ * Stalwart principal/login name = local part of the user's email address.
+ * This MUST match what email.routes.ts (/inbox) uses to log into IMAP, which is
+ * `(user.email).split('@')[0]`. Using `user.username` here was a bug — username
+ * is for BAL Connect login, not mail.
+ */
+function defaultMailLogin(user: { email?: string | null; username?: string }): string {
+  const email = user.email || '';
+  if (email.includes('@')) return email.split('@')[0];
+  // Fallback if email missing (older accounts) — use username + domain.
+  return user.username || '';
+}
+
+/**
+ * Mail address = the user's email field directly. If somehow blank, construct
+ * from username and STALWART_DOMAIN.
+ */
+function defaultMailEmail(user: { email?: string | null; username?: string }, customDomain?: string): string {
+  if (user.email && user.email.includes('@')) return user.email;
+  return `${user.username}@${customDomain || MAIL_DOMAIN}`;
+}
+
+// GET /api/admin/users/:id/mail-account — Show current mail account state
+router.get('/users/:id/mail-account', async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT id, username, email, display_name, mail_status,
+              mail_assigned_at, mail_assigned_by, mail_last_test_at, mail_last_test_ok,
+              (mail_password_encrypted IS NOT NULL OR mail_password IS NOT NULL) as has_credential
+         FROM users WHERE id = $1`,
+      [req.params.id],
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    const user = result.rows[0];
+    let assignedByName: string | null = null;
+    if (user.mail_assigned_by) {
+      const r = await query('SELECT display_name FROM users WHERE id = $1', [user.mail_assigned_by]);
+      assignedByName = r.rows[0]?.display_name || null;
+    }
+
+    res.json({
+      userId: user.id,
+      username: user.username,
+      mailEmail: defaultMailEmail(user),
+      status: user.mail_status,
+      hasCredential: user.has_credential,
+      assignedAt: user.mail_assigned_at,
+      assignedBy: user.mail_assigned_by,
+      assignedByName,
+      lastTestAt: user.mail_last_test_at,
+      lastTestOk: user.mail_last_test_ok,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/users/:id/mail-account — Create or assign mail account
+// Body: { mode: 'auto' | 'manual', password?: string, customEmail?: string }
+//   - 'auto':   generate password, create principal in Stalwart, save encrypted creds
+//   - 'manual': admin provides existing Stalwart password; we test it before saving
+router.post('/users/:id/mail-account', async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.params.id;
+    const { mode, password: providedPassword, customEmail } = req.body || {};
+
+    if (mode !== 'auto' && mode !== 'manual') {
+      return res.status(400).json({ error: 'mode must be "auto" or "manual"' });
+    }
+    if (mode === 'manual' && !providedPassword) {
+      return res.status(400).json({ error: 'password is required for manual mode' });
+    }
+
+    const userResult = await query(
+      'SELECT id, username, display_name, email FROM users WHERE id = $1',
+      [userId],
+    );
+    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = userResult.rows[0];
+
+    const loginName = defaultMailLogin(user);
+    const mailEmail = customEmail || defaultMailEmail(user);
+    const password = mode === 'auto' ? generateMailPassword(12) : String(providedPassword);
+
+    // For auto mode: ensure the principal does not already exist (avoid silent overwrites)
+    if (mode === 'auto') {
+      const existing = await stalwart.getPrincipal(loginName);
+      if (existing) {
+        return res.status(409).json({
+          error: `Stalwart principal "${loginName}" already exists. Use manual mode to assign existing or delete it first.`,
+        });
+      }
+      try {
+        await stalwart.createPrincipal({
+          name: loginName,
+          password,
+          email: mailEmail,
+          description: user.display_name || user.username,
+        });
+      } catch (err: any) {
+        return res.status(502).json({ error: 'Stalwart create failed: ' + err.message });
+      }
+    } else {
+      // manual: test credentials before saving
+      const test = await stalwart.testCredentials(loginName, password);
+      if (!test.ok) {
+        return res.status(400).json({ error: 'Provided credentials failed IMAP login: ' + test.error });
+      }
+    }
+
+    // Encrypt and persist
+    const encrypted = encryptSecret(password);
+    await query(
+      `UPDATE users
+         SET mail_password_encrypted = $1,
+             mail_password = NULL,
+             mail_status = 'active',
+             mail_assigned_at = NOW(),
+             mail_assigned_by = $2,
+             mail_last_test_at = NOW(),
+             mail_last_test_ok = TRUE,
+             updated_at = NOW()
+       WHERE id = $3`,
+      [encrypted, req.user!.userId, userId],
+    );
+
+    await writeAuditLog(
+      req.user!.userId,
+      userId,
+      mode === 'auto' ? 'mail_account.created' : 'mail_account.assigned',
+      { mailEmail, loginName, mode },
+      req.ip,
+    );
+
+    console.log(`[Admin] Mail account ${mode === 'auto' ? 'created' : 'assigned'} for ${user.username} (${mailEmail})`);
+
+    // Return generated password ONCE so admin can hand it to the user.
+    res.json({
+      ok: true,
+      mode,
+      mailEmail,
+      loginName,
+      password: mode === 'auto' ? password : undefined,
+    });
+  } catch (err: any) {
+    console.error('[Admin] mail-account create error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/admin/users/:id/mail-account/reset-password — Generate new password and push to Stalwart
+router.put('/users/:id/mail-account/reset-password', async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.params.id;
+    const userResult = await query(
+      `SELECT id, username, email, display_name, mail_status FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = userResult.rows[0];
+
+    if (user.mail_status === 'none') {
+      return res.status(400).json({ error: 'User has no mail account. Create one first.' });
+    }
+
+    const loginName = defaultMailLogin(user);
+    const newPassword = generateMailPassword(12);
+
+    try {
+      await stalwart.setPrincipalPassword(loginName, newPassword);
+    } catch (err: any) {
+      return res.status(502).json({ error: 'Stalwart password update failed: ' + err.message });
+    }
+
+    const encrypted = encryptSecret(newPassword);
+    await query(
+      `UPDATE users
+         SET mail_password_encrypted = $1,
+             mail_password = NULL,
+             mail_status = 'active',
+             mail_last_test_at = NOW(),
+             mail_last_test_ok = TRUE,
+             updated_at = NOW()
+       WHERE id = $2`,
+      [encrypted, userId],
+    );
+
+    await writeAuditLog(
+      req.user!.userId,
+      userId,
+      'mail_account.password_reset',
+      { loginName },
+      req.ip,
+    );
+
+    console.log(`[Admin] Mail password reset for ${user.username}`);
+    res.json({ ok: true, loginName, password: newPassword });
+  } catch (err: any) {
+    console.error('[Admin] mail-account reset error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/admin/users/:id/mail-account/toggle — Enable/Disable mail access
+// Body: { enable: boolean }
+router.put('/users/:id/mail-account/toggle', async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.params.id;
+    const enable = req.body?.enable === true;
+
+    const userResult = await query(
+      'SELECT id, username, email, mail_status FROM users WHERE id = $1',
+      [userId],
+    );
+    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = userResult.rows[0];
+
+    if (user.mail_status === 'none') {
+      return res.status(400).json({ error: 'User has no mail account. Create one first.' });
+    }
+
+    const loginName = defaultMailLogin(user);
+
+    try {
+      await stalwart.setPrincipalEnabled(loginName, enable);
+    } catch (err: any) {
+      return res.status(502).json({ error: 'Stalwart toggle failed: ' + err.message });
+    }
+
+    await query(
+      `UPDATE users SET mail_status = $1, updated_at = NOW() WHERE id = $2`,
+      [enable ? 'active' : 'disabled', userId],
+    );
+
+    await writeAuditLog(
+      req.user!.userId,
+      userId,
+      enable ? 'mail_account.enabled' : 'mail_account.disabled',
+      { loginName },
+      req.ip,
+    );
+
+    console.log(`[Admin] Mail ${enable ? 'enabled' : 'disabled'} for ${user.username}`);
+    res.json({ ok: true, status: enable ? 'active' : 'disabled' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/users/:id/mail-account/test — Live test credentials
+router.post('/users/:id/mail-account/test', async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.params.id;
+
+    const userResult = await query(
+      `SELECT id, username, email, mail_status, mail_password_encrypted, mail_password
+         FROM users WHERE id = $1`,
+      [userId],
+    );
+    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = userResult.rows[0];
+
+    if (user.mail_status === 'none') {
+      return res.status(400).json({ error: 'User has no mail account.' });
+    }
+
+    // Decrypt or fall back to plaintext for backward compat
+    let password = '';
+    try {
+      if (user.mail_password_encrypted) {
+        const { decryptSecret } = await import('../../utils/crypto');
+        password = decryptSecret(user.mail_password_encrypted);
+      } else if (user.mail_password) {
+        password = user.mail_password;
+      }
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Failed to decrypt stored password: ' + err.message });
+    }
+
+    if (!password) return res.status(400).json({ error: 'No credential stored' });
+
+    // Test using the SAME loginName that IMAP /inbox uses (email local part)
+    const loginName = defaultMailLogin(user);
+    const test = await stalwart.testCredentials(loginName, password);
+
+    await query(
+      `UPDATE users
+         SET mail_last_test_at = NOW(),
+             mail_last_test_ok = $1,
+             mail_status = CASE
+               WHEN $1::boolean THEN (CASE WHEN mail_status = 'error' THEN 'active' ELSE mail_status END)
+               ELSE 'error'
+             END,
+             updated_at = NOW()
+       WHERE id = $2`,
+      [test.ok, userId],
+    );
+
+    await writeAuditLog(
+      req.user!.userId,
+      userId,
+      'mail_account.tested',
+      { ok: test.ok, error: test.error },
+      req.ip,
+    );
+
+    res.json({ ok: test.ok, error: test.error });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

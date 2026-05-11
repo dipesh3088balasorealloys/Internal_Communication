@@ -1,0 +1,56 @@
+# LiveKit Server config — used by docker-compose `livekit` service.
+# Reference: https://docs.livekit.io/home/self-hosting/local/
+#
+# IMPORTANT (production):
+#   - Generate fresh keys: `openssl rand -hex 16` (API key) / `openssl rand -hex 32` (secret)
+#   - Replace the dev creds below
+#   - Set log_level: info in production
+
+port: 7880
+bind_addresses:
+  - ""
+
+# Logging
+log_level: info
+
+# RTC config — media transport (PRODUCTION — native Linux Docker)
+# On Linux, Docker uses real iptables bridging. UDP forwarding works correctly
+# (unlike Docker Desktop on Windows where WSL2 NAT breaks WebRTC DTLS).
+rtc:
+  # TCP fallback for clients behind strict corporate firewalls
+  tcp_port: 7881
+  # UDP media port range — must match docker-compose port mapping
+  port_range_start: 50000
+  port_range_end: 50100
+  # On production server (192.168.10.15), all clients are on the same LAN
+  # or connected via VPN. Advertise the server's LAN IP directly.
+  use_external_ip: false
+  node_ip: "192.168.10.15"
+  # Enable TURN-like relay for any client that can't do direct UDP
+  enable_loopback_candidate: false
+
+# Authentication — keys here MUST match the server's LIVEKIT_API_KEY / LIVEKIT_API_SECRET env vars
+# JWTs minted by our backend will be signed with the matching secret
+keys:
+  devkey_local: devsecret_local_at_least_32_characters_long_xx
+
+# Room defaults — these apply when our backend creates a room without specifying
+room:
+  enabled_codecs:
+    - mime: audio/opus
+    - mime: video/VP8
+    - mime: video/H264
+    - mime: video/VP9
+  max_participants: 30
+  empty_timeout: 300       # auto-close empty rooms after 5 min
+  departure_timeout: 20    # remove participant after 20s of disconnection
+
+# Built-in TURN server (relay for participants whose UDP is blocked)
+# Enable if VPN users or strict-firewall users can't get UDP through.
+turn:
+  enabled: true
+  # Use the same TCP port as signaling for TURN relay
+  # Clients that can't reach UDP 50000-50100 will relay through this
+  tls_port: 0
+  udp_port: 3478
+  external_tls: false

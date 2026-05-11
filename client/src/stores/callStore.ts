@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { webrtcService, type ActiveCall, type CallType, type CallEndData } from '@/services/webrtc';
 import { getSocket } from '@/services/socket';
+import * as livekitApi from '@/services/livekit';
+import { useAuthStore } from '@/stores/authStore';
 import {
   showDesktopNotification,
   playCallRingtone,
@@ -67,8 +69,25 @@ export interface GroupCallState {
   conversationId: string | null;
   callType: CallType;
   groupName: string;
-  participants: GroupCallParticipant[];
+  participants: GroupCallParticipant[];   // (legacy — LiveKit's own roster is in the component)
   startTime: Date | null;
+
+  // New LiveKit fields — present when we're connected via SFU
+  callId: string | null;
+  livekitToken: string | null;
+  livekitWsUrl: string | null;
+  livekitRoomName: string | null;
+  isHost: boolean;
+}
+
+export interface IncomingGroupCallInvite {
+  callId: string;
+  conversationId: string;
+  callType: CallType;
+  hostId: string;
+  hostName: string;
+  roomName: string;
+  startedAt: string;
 }
 
 interface CallState {
@@ -78,6 +97,7 @@ interface CallState {
   currentCall: ActiveCall | null;
   isScreenSharing: boolean;
   groupCall: GroupCallState | null;
+  incomingGroupInvite: IncomingGroupCallInvite | null;
 
   initWebRTC: (socket: any) => void;
   makeCall: (targetUserId: string, type: CallType, remoteName?: string, conversationId?: string) => Promise<void>;
@@ -90,14 +110,19 @@ interface CallState {
   stopScreenShare: (callId: string) => Promise<void>;
   dismissIncoming: () => void;
 
-  // Group call actions
-  startGroupCall: (conversationId: string, callType: CallType, groupName: string) => void;
+  // Group call actions (LiveKit-backed)
+  startGroupCall: (conversationId: string, callType: CallType, groupName?: string) => Promise<void>;
+  acceptGroupInvite: (callId: string) => Promise<void>;
+  declineGroupInvite: (callId: string) => Promise<void>;
+  receiveGroupInvite: (invite: IncomingGroupCallInvite) => void;
+  leaveGroupCall: () => Promise<void>;
+  endGroupCallForAll: () => Promise<void>;
+  endGroupCall: () => void;
+  // (legacy helpers retained for any callers — no-ops in LiveKit mode)
   joinGroupCall: (conversationId: string, callType: CallType, groupName: string) => void;
-  leaveGroupCall: () => void;
   addGroupParticipant: (participant: GroupCallParticipant) => void;
   removeGroupParticipant: (userId: string) => void;
   updateGroupParticipant: (userId: string, updates: Partial<GroupCallParticipant>) => void;
-  endGroupCall: () => void;
 }
 
 export const useCallStore = create<CallState>((set, get) => {
@@ -176,10 +201,34 @@ export const useCallStore = create<CallState>((set, get) => {
     currentCall: null,
     isScreenSharing: false,
     groupCall: null,
+    incomingGroupInvite: null,
 
     initWebRTC: (socket) => {
       webrtcService.initSignaling(socket);
       set({ isReady: socket.connected });
+
+      // Listen for group call socket events emitted by the server
+      socket.on('group-call:incoming', (invite: IncomingGroupCallInvite) => {
+        // Ignore if we're the one who started it (server broadcasts to whole conv room)
+        const me = useAuthStore.getState().user?.id;
+        if (me && invite.hostId === me) return;
+        // Ignore if we're already in this call
+        if (useCallStore.getState().groupCall?.callId === invite.callId) return;
+
+        useCallStore.getState().receiveGroupInvite(invite);
+      });
+
+      socket.on('group-call:ended', (data: { callId: string; endedBy?: string }) => {
+        const state = useCallStore.getState();
+        if (state.groupCall?.callId === data.callId) {
+          state.endGroupCall();
+        }
+        if (state.incomingGroupInvite?.callId === data.callId) {
+          set({ incomingGroupInvite: null });
+          ringtoneHandle?.stop();
+          ringtoneHandle = null;
+        }
+      });
     },
 
     makeCall: async (targetUserId, type, remoteName, conversationId) => {
@@ -250,70 +299,127 @@ export const useCallStore = create<CallState>((set, get) => {
       set({ incomingCall: null });
     },
 
-    // Group call actions
-    startGroupCall: (conversationId, callType, groupName) => {
-      set({
-        groupCall: {
-          isActive: true,
-          conversationId,
-          callType,
-          groupName,
-          participants: [],
-          startTime: new Date(),
-        },
-      });
+    // ─── Group call actions (LiveKit-backed) ──────────────────────────────
+
+    startGroupCall: async (conversationId, callType, groupName = '') => {
+      try {
+        const result = await livekitApi.startGroupCall(conversationId, callType);
+        set({
+          groupCall: {
+            isActive: true,
+            conversationId,
+            callType,
+            groupName,
+            participants: [],
+            startTime: new Date(),
+            callId: result.callId,
+            livekitToken: result.livekit.token,
+            livekitWsUrl: result.livekit.wsUrl,
+            livekitRoomName: result.livekit.roomName,
+            isHost: true,
+          },
+        });
+        playCallConnectedChime();
+      } catch (err: any) {
+        console.error('[CallStore] startGroupCall failed:', err?.response?.data?.error || err.message);
+        alert('Failed to start group call: ' + (err?.response?.data?.error || err.message));
+      }
     },
 
-    joinGroupCall: (conversationId, callType, groupName) => {
-      set({
-        groupCall: {
-          isActive: true,
-          conversationId,
-          callType,
-          groupName,
-          participants: [],
-          startTime: new Date(),
-        },
-      });
+    receiveGroupInvite: (invite) => {
+      set({ incomingGroupInvite: invite });
+      const prefs = getNotificationPrefs();
+      if (prefs.sound) {
+        ringtoneHandle?.stop();
+        ringtoneHandle = playCallRingtone();
+      }
+      if (prefs.desktop) {
+        const callTypeLabel = invite.callType === 'video' ? 'Group Video Call' : 'Group Audio Call';
+        showDesktopNotification({
+          title: `Incoming ${callTypeLabel}`,
+          body: `${invite.hostName} started a group call`,
+          tag: `group-call-${invite.callId}`,
+          requireInteraction: true,
+        });
+      }
     },
 
-    leaveGroupCall: () => {
+    acceptGroupInvite: async (callId) => {
+      const invite = useCallStore.getState().incomingGroupInvite;
+      if (!invite || invite.callId !== callId) return;
+      ringtoneHandle?.stop();
+      ringtoneHandle = null;
+      try {
+        const result = await livekitApi.joinGroupCall(callId);
+        set({
+          incomingGroupInvite: null,
+          groupCall: {
+            isActive: true,
+            conversationId: invite.conversationId,
+            callType: invite.callType,
+            groupName: '',
+            participants: [],
+            startTime: new Date(),
+            callId,
+            livekitToken: result.livekit.token,
+            livekitWsUrl: result.livekit.wsUrl,
+            livekitRoomName: result.livekit.roomName,
+            isHost: false,
+          },
+        });
+        playCallConnectedChime();
+      } catch (err: any) {
+        console.error('[CallStore] acceptGroupInvite failed:', err?.response?.data?.error || err.message);
+        alert('Failed to join call: ' + (err?.response?.data?.error || err.message));
+        set({ incomingGroupInvite: null });
+      }
+    },
+
+    declineGroupInvite: async (callId) => {
+      ringtoneHandle?.stop();
+      ringtoneHandle = null;
+      set({ incomingGroupInvite: null });
+      try {
+        await livekitApi.declineGroupCall(callId);
+      } catch (err) {
+        console.warn('[CallStore] decline call failed (non-critical):', err);
+      }
+    },
+
+    leaveGroupCall: async () => {
+      // Just clear local state. LiveKit's <LiveKitRoom> will trigger an onDisconnected
+      // handler that notifies the server. Server cleans up empty rooms automatically.
+      playCallEndedTone();
+      set({ groupCall: null });
+    },
+
+    endGroupCallForAll: async () => {
       const state = useCallStore.getState();
-      if (state.groupCall?.conversationId) {
-        const socket = getSocket();
-        socket?.emit('group-call:leave', { conversationId: state.groupCall.conversationId });
+      const callId = state.groupCall?.callId;
+      if (!callId) return;
+      playCallEndedTone();
+      try {
+        await livekitApi.endGroupCall(callId);
+      } catch (err: any) {
+        console.error('[CallStore] endGroupCall failed:', err?.response?.data?.error || err.message);
       }
-      if (state.currentCall) {
-        webrtcService.hangup(state.currentCall.id).catch(console.error);
-      }
-      set({ groupCall: null, currentCall: null });
-    },
-
-    addGroupParticipant: (participant) => {
-      set((state) => {
-        if (!state.groupCall) return state;
-        const exists = state.groupCall.participants.some((p) => p.userId === participant.userId);
-        if (exists) return state;
-        return { groupCall: { ...state.groupCall, participants: [...state.groupCall.participants, participant] } };
-      });
-    },
-
-    removeGroupParticipant: (userId) => {
-      set((state) => {
-        if (!state.groupCall) return state;
-        return { groupCall: { ...state.groupCall, participants: state.groupCall.participants.filter((p) => p.userId !== userId) } };
-      });
-    },
-
-    updateGroupParticipant: (userId, updates) => {
-      set((state) => {
-        if (!state.groupCall) return state;
-        return { groupCall: { ...state.groupCall, participants: state.groupCall.participants.map((p) => p.userId === userId ? { ...p, ...updates } : p) } };
-      });
+      set({ groupCall: null });
     },
 
     endGroupCall: () => {
+      playCallEndedTone();
       set({ groupCall: null });
     },
+
+    // ─── Legacy no-op shims (kept for backward compat with any existing callers) ─
+
+    joinGroupCall: () => {
+      // Legacy peer-to-peer flow is replaced by acceptGroupInvite(callId).
+      console.warn('[CallStore] joinGroupCall is deprecated — use acceptGroupInvite');
+    },
+
+    addGroupParticipant: () => { /* LiveKit owns participant state now */ },
+    removeGroupParticipant: () => { /* LiveKit owns participant state now */ },
+    updateGroupParticipant: () => { /* LiveKit owns participant state now */ },
   };
 });

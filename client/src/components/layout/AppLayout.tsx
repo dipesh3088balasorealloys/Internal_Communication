@@ -11,6 +11,7 @@ import { useChatStore } from '@/stores/chatStore';
 import { useCallStore } from '@/stores/callStore';
 import { useWindowSize, BREAKPOINTS } from '@/hooks/useWindowSize';
 import IncomingCallModal from '@/components/calls/IncomingCallModal';
+import IncomingGroupCallModal from '@/components/calls/IncomingGroupCallModal';
 import ActiveCallOverlay from '@/components/calls/ActiveCallOverlay';
 import GroupCallOverlay from '@/components/calls/GroupCallOverlay';
 import {
@@ -379,6 +380,7 @@ export default function AppLayout() {
       </div>
       {/* Call Overlays */}
       <IncomingCallModal />
+      <IncomingGroupCallModal />
       <ActiveCallOverlay />
       <GroupCallOverlay />
     </>
