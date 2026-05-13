@@ -75,7 +75,7 @@ function GroupCallContent() {
     return () => clearInterval(interval);
   }, []);
 
-  // Get all tracks (camera + screen share) for grid
+  // Get all tracks (camera + screen share) for layout decisions
   const tracks = useTracks(
     [
       { source: Track.Source.Camera, withPlaceholder: true },
@@ -83,6 +83,24 @@ function GroupCallContent() {
     ],
     { onlySubscribed: false },
   );
+
+  // ── Teams-style screen share spotlight ────────────────────────────────────
+  // If anyone is sharing their screen, that share becomes the FOCUS (big tile,
+  // takes the main area). Everyone else's video moves to a sidebar carousel.
+  // When the share stops, we fall back to the normal grid layout.
+  //
+  // If multiple people share at once (unusual), the first share wins focus
+  // and the rest go into the carousel alongside cameras.
+  const screenShareTracks = tracks.filter(
+    (t) => t.publication?.source === Track.Source.ScreenShare && t.publication?.track,
+  );
+  const cameraTracks = tracks.filter(
+    (t) => t.publication?.source !== Track.Source.ScreenShare,
+  );
+  const focusTrack = screenShareTracks[0];
+  const carouselTracks = focusTrack
+    ? [...cameraTracks, ...screenShareTracks.slice(1)]
+    : [];
 
   const participants = useParticipants();
   const participantCount = participants.length;
@@ -181,13 +199,69 @@ function GroupCallContent() {
         </div>
       </div>
 
-      {/* Main area: grid + optional participants panel */}
+      {/* Main area: grid (or focus+carousel when someone shares screen) + optional participants panel */}
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        {/* Grid */}
         <div style={{ flex: 1, padding: 16, minWidth: 0 }}>
-          <GridLayout tracks={tracks} style={{ height: '100%' }}>
-            <ParticipantTile />
-          </GridLayout>
+          {focusTrack ? (
+            // ── Teams-style spotlight ──
+            // The shared screen takes the main area (left, fills available width).
+            // Camera tiles stack vertically in a fixed-width sidebar (right).
+            // Layout is computed from the live `tracks` array — fully dynamic, no
+            // assumptions about who's sharing or how many participants there are.
+            <div
+              style={{
+                height: '100%',
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1fr) 240px',
+                gap: 12,
+              }}
+            >
+              {/* Main spotlight — the shared screen */}
+              <div
+                style={{
+                  minWidth: 0,
+                  minHeight: 0,
+                  borderRadius: 12,
+                  overflow: 'hidden',
+                  background: '#000',
+                }}
+              >
+                <ParticipantTile trackRef={focusTrack} style={{ height: '100%', width: '100%' }} />
+              </div>
+
+              {/* Right sidebar — every participant's camera (or placeholder) as a small tile */}
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                  overflowY: 'auto',
+                  minHeight: 0,
+                  paddingRight: 4,
+                }}
+              >
+                {carouselTracks.map((tr, idx) => (
+                  <div
+                    key={`${tr.participant.identity}:${tr.publication?.trackSid || tr.source || idx}`}
+                    style={{
+                      flex: '0 0 auto',
+                      aspectRatio: '16 / 9',
+                      borderRadius: 10,
+                      overflow: 'hidden',
+                      background: '#1A1A2E',
+                    }}
+                  >
+                    <ParticipantTile trackRef={tr} style={{ height: '100%', width: '100%' }} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            // No screen share — normal equal-size grid
+            <GridLayout tracks={tracks} style={{ height: '100%' }}>
+              <ParticipantTile />
+            </GridLayout>
+          )}
         </div>
 
         {/* Participants side panel (toggleable) */}

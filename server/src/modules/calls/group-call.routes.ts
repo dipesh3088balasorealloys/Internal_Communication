@@ -49,6 +49,109 @@ async function getDisplayName(userId: string): Promise<string> {
 }
 
 // ------------------------------------------------------------------
+// GET /api/calls/group/active?conversationId=...
+// ------------------------------------------------------------------
+// Returns the ONE active (ringing or answered) group call for a conversation,
+// or { call: null } if none.
+//
+// Reconciles with LiveKit before returning: if the DB says a call is active
+// but LiveKit's room has 0 participants (or doesn't exist), the call is
+// auto-marked as 'ended'. This handles the common "ghost call" problem where
+// the host's browser crashed / closed without calling /end, leaving a stale
+// row that would otherwise show the banner forever.
+//
+// Used to render the "Meeting in progress — Join" banner.
+router.get('/active', async (req: AuthRequest, res: Response) => {
+  try {
+    const conversationId = String(req.query.conversationId || '');
+    if (!conversationId) return res.status(400).json({ error: 'conversationId required' });
+
+    const userId = req.user!.userId;
+    if (!(await isConversationMember(conversationId, userId))) {
+      return res.status(403).json({ error: 'Not a member of this conversation' });
+    }
+
+    const r = await query(
+      `SELECT ch.id              AS call_id,
+              ch.call_type,
+              ch.host_user_id,
+              ch.livekit_room_name,
+              ch.started_at,
+              ch.participants,
+              u.display_name      AS host_name,
+              u.username          AS host_username
+         FROM call_history ch
+         LEFT JOIN users u ON u.id = ch.host_user_id
+        WHERE ch.conversation_id = $1
+          AND ch.is_group_call = TRUE
+          AND ch.status IN ('ringing', 'answered')
+        ORDER BY ch.started_at DESC
+        LIMIT 1`,
+      [conversationId],
+    );
+
+    if (r.rows.length === 0) return res.json({ call: null });
+
+    const row = r.rows[0];
+
+    // ── Reconcile with LiveKit — verify the room actually has participants ──
+    // Grace period: a brand-new call (< 60s old) might not have anyone yet because
+    // the host is still connecting. Don't auto-end during the grace window.
+    const ageMs = Date.now() - new Date(row.started_at).getTime();
+    const isInGracePeriod = ageMs < 60_000;
+
+    if (row.livekit_room_name && !isInGracePeriod) {
+      try {
+        const liveParticipants = await livekit.listParticipants(row.livekit_room_name);
+        if (!liveParticipants || liveParticipants.length === 0) {
+          // Ghost call — room is empty (host closed browser etc.). Auto-end it.
+          console.log(`[GroupCall] Ghost call detected (id=${row.call_id}, room=${row.livekit_room_name}) — auto-ending`);
+          await query(
+            `UPDATE call_history
+                SET status = 'ended',
+                    ended_at = NOW(),
+                    duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::int
+              WHERE id = $1`,
+            [row.call_id],
+          );
+          // Broadcast so any banners clear immediately on every client
+          const io = getIO();
+          io.to(`conv:${conversationId}`).emit('group-call:active-ended', {
+            callId: row.call_id,
+            conversationId,
+          });
+          return res.json({ call: null });
+        }
+      } catch (err: any) {
+        // LiveKit is unreachable (e.g. Docker container is down). Be conservative:
+        // don't auto-end (we'd lose legitimate calls during transient outages).
+        // But signal the dead state to the client so it doesn't pretend it's joinable.
+        console.warn(`[GroupCall] LiveKit unreachable while reconciling call ${row.call_id}: ${err.message}`);
+        return res.json({
+          call: null,
+          warning: 'LiveKit server unreachable — group calls temporarily unavailable',
+        });
+      }
+    }
+
+    return res.json({
+      call: {
+        callId: row.call_id,
+        callType: row.call_type,
+        hostId: row.host_user_id,
+        hostName: row.host_name || row.host_username || 'Host',
+        roomName: row.livekit_room_name,
+        startedAt: row.started_at,
+        participants: row.participants || [],
+      },
+    });
+  } catch (err: any) {
+    console.error('[GroupCall] active error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------------------------------------------------
 // POST /api/calls/group/start
 // ------------------------------------------------------------------
 // Body: { conversationId: string, callType: 'audio' | 'video' }
@@ -113,6 +216,7 @@ router.post('/start', async (req: AuthRequest, res: Response) => {
 
     // Ring all other conversation members via Socket.IO
     const io = getIO();
+    const startedAt = new Date().toISOString();
     io.to(`conv:${conversationId}`).emit('group-call:incoming', {
       callId,
       conversationId,
@@ -120,7 +224,20 @@ router.post('/start', async (req: AuthRequest, res: Response) => {
       hostId,
       hostName,
       roomName,
-      startedAt: new Date().toISOString(),
+      startedAt,
+    });
+
+    // Persistent active-meeting marker so late joiners can discover and join.
+    // Sent to the same room — clients merge this into a per-conversation map.
+    io.to(`conv:${conversationId}`).emit('group-call:active', {
+      callId,
+      conversationId,
+      callType,
+      hostId,
+      hostName,
+      roomName,
+      startedAt,
+      participants: [{ userId: hostId, displayName: hostName, joinedAt: startedAt }],
     });
 
     console.log(`[GroupCall] ${hostName} started ${callType} call in ${conversationId} (room=${roomName})`);
@@ -258,6 +375,11 @@ router.post('/:callId/end', async (req: AuthRequest, res: Response) => {
       callId,
       conversationId: call.conversation_id,
       endedBy: userId,
+    });
+    // Clear the persistent banner on all clients
+    io.to(`conv:${call.conversation_id}`).emit('group-call:active-ended', {
+      callId,
+      conversationId: call.conversation_id,
     });
 
     res.json({ ok: true });

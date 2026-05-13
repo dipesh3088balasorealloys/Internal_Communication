@@ -16,6 +16,7 @@ import MessageList from './MessageList';
 import MessageInput from './MessageInput';
 import CallDialog from '@/components/calls/CallDialog';
 import AddMemberModal from './AddMemberModal';
+import ActiveMeetingBanner from '@/components/calls/ActiveMeetingBanner';
 import type { Conversation } from '@/types';
 
 export default function ChatWindow() {
@@ -323,6 +324,9 @@ export default function ChatWindow() {
             </button>
           </div>
         )}
+
+        {/* Active meeting banner — appears when a group call is in progress in this conversation */}
+        {conversationId && conv?.type === 'group' && <ActiveMeetingBanner conversationId={conversationId} />}
 
         {/* Messages */}
         <MessageList

@@ -59,3 +59,26 @@ export async function kickGroupParticipant(callId: string, targetUserId: string)
 export async function muteGroupParticipant(callId: string, targetUserId: string, mute: boolean): Promise<void> {
   await api.post(`/calls/group/${callId}/mute-user`, { targetUserId, mute });
 }
+
+export interface ActiveCallInfo {
+  callId: string;
+  callType: 'audio' | 'video';
+  hostId: string;
+  hostName: string;
+  roomName: string;
+  startedAt: string;
+  participants: Array<{ userId: string; displayName: string; joinedAt: string }>;
+}
+
+/**
+ * Find the currently active group call (if any) for a conversation.
+ *
+ * Used to render the "Meeting in progress — Join" banner so users who weren't
+ * online when the call started can still discover and join it.
+ *
+ * Returns null if no active call.
+ */
+export async function getActiveGroupCall(conversationId: string): Promise<ActiveCallInfo | null> {
+  const { data } = await api.get('/calls/group/active', { params: { conversationId } });
+  return data?.call || null;
+}

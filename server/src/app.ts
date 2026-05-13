@@ -46,6 +46,22 @@ async function bootstrap() {
   await query('UPDATE users SET status = $1', ['offline']);
   console.log('[DB] All users reset to offline');
 
+  // 2c. Clear stale group calls — any call still marked 'ringing'/'answered' from
+  // a previous run is a ghost (LiveKit rooms don't survive restarts, and no client
+  // is connected to drive the lifecycle). Mark them all ended.
+  const ghostCleanup = await query(
+    `UPDATE call_history
+        SET status = 'ended',
+            ended_at = NOW(),
+            duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::int
+      WHERE is_group_call = TRUE
+        AND status IN ('ringing', 'answered')
+      RETURNING id`,
+  );
+  if (ghostCleanup.rows.length > 0) {
+    console.log(`[DB] Cleaned up ${ghostCleanup.rows.length} stale group call(s) from previous run`);
+  }
+
   // 3. Init Redis + clear stale presence
   await initRedis();
   await clearAllPresence();

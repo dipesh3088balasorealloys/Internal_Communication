@@ -1,6 +1,12 @@
 import nodemailer from 'nodemailer';
+// MailComposer is exported by nodemailer for building raw MIME messages
+// We use it to build the message once for BOTH SMTP send and IMAP APPEND
+// (same pattern Outlook/Thunderbird use to keep sent copies in the user's Sent folder)
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const MailComposer = require('nodemailer/lib/mail-composer');
 import { query } from '../../database/connection';
 import { tryDecryptSecret } from '../../utils/crypto';
+import { appendToSentFolder } from './imap.service';
 
 const STALWART_HOST = process.env.STALWART_SMTP_HOST || '';
 const STALWART_PORT = parseInt(process.env.STALWART_SMTP_PORT || '587');
@@ -71,6 +77,10 @@ export interface SendEmailOptions {
   fromName?: string;
   mailPassword?: string;
   attachments?: Array<{ filename: string; path?: string; content?: Buffer; contentType?: string }>;
+  /** Message-ID of the email being replied to (In-Reply-To header) */
+  inReplyTo?: string;
+  /** List of all ancestor Message-IDs in the thread (References header) */
+  references?: string[];
 }
 
 export async function sendEmail(options: SendEmailOptions): Promise<{ messageId: string; accepted: string[] }> {
@@ -88,7 +98,15 @@ export async function sendEmail(options: SendEmailOptions): Promise<{ messageId:
   const transport = createUserStalwartTransport(userLogin, mailPass);
   const fromAddress = `"${senderName}" <${senderEmail}>`;
 
-  const result = await transport.sendMail({
+  // Build References header: all ancestor Message-IDs (for threading)
+  const referencesHeader = options.references && options.references.length > 0
+    ? options.references.join(' ')
+    : undefined;
+
+  // ── Build the raw MIME message ONCE — used for both SMTP send and IMAP APPEND ──
+  // This is the same pattern Outlook/Thunderbird use: compile once, send via SMTP,
+  // then append the same bytes to the user's Sent folder via IMAP.
+  const mailOpts: any = {
     from: fromAddress,
     to: recipients.join(', '),
     cc: options.cc ? (Array.isArray(options.cc) ? options.cc.join(', ') : options.cc) : undefined,
@@ -97,11 +115,47 @@ export async function sendEmail(options: SendEmailOptions): Promise<{ messageId:
     text: options.text,
     html: options.html,
     replyTo: options.replyTo,
+    inReplyTo: options.inReplyTo || undefined,
+    references: referencesHeader,
     attachments: options.attachments,
+  };
+
+  console.log(`[SENDMAIL] options.inReplyTo=${options.inReplyTo || 'NONE'} options.references=${referencesHeader || 'NONE'}`);
+
+  const composer = new MailComposer(mailOpts);
+  const compiled = composer.compile();
+  const rawMessage: Buffer = await new Promise((resolve, reject) => {
+    compiled.build((err: any, msg: Buffer) => (err ? reject(err) : resolve(msg)));
+  });
+  const envelope = compiled.getEnvelope();
+  const compiledMessageId: string = compiled.messageId();
+
+  // Log a snippet of the raw message headers so we can verify In-Reply-To/References
+  // are actually being included in the SMTP-bound bytes
+  const rawHeadersOnly = rawMessage.toString('utf8').split(/\r?\n\r?\n/)[0] || '';
+  const hasInReplyTo = /^In-Reply-To:/im.test(rawHeadersOnly);
+  const hasReferences = /^References:/im.test(rawHeadersOnly);
+  console.log(`[SENDMAIL] Compiled message — messageId=${compiledMessageId} hasInReplyToHeader=${hasInReplyTo} hasReferencesHeader=${hasReferences}`);
+
+  // Send via SMTP using the pre-built raw bytes (guarantees same Message-ID for APPEND)
+  const result = await transport.sendMail({
+    envelope,
+    raw: rawMessage,
   });
 
+  // ── APPEND to user's IMAP Sent folder (fire-and-forget) ──
+  // This is critical for threading: when someone replies, we need to find this email
+  // in the sender's mailbox via IMAP search. Without APPEND, the message only exists
+  // in the recipient's INBOX and is invisible to the sender.
+  appendToSentFolder(rawMessage, userLogin, mailPass).catch((err: any) =>
+    console.warn('[EMAIL] APPEND to Sent failed (non-fatal):', err.message),
+  );
+
   console.log(`[EMAIL] Sent via Stalwart as ${senderEmail} to ${recipients.join(', ')}`);
-  return { messageId: result.messageId, accepted: result.accepted as string[] };
+  return {
+    messageId: result.messageId || compiledMessageId,
+    accepted: (result.accepted || recipients) as string[],
+  };
 }
 
 export function getTransporter() {

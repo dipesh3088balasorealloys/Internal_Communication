@@ -90,6 +90,24 @@ export interface IncomingGroupCallInvite {
   startedAt: string;
 }
 
+/**
+ * Persistent "Meeting in progress" marker per conversation.
+ * Populated from:
+ *   - `group-call:active` socket event (broadcast at call start)
+ *   - REST `getActiveGroupCall()` on conversation open (for late joiners who missed the event)
+ * Cleared by `group-call:active-ended` and `group-call:ended`.
+ */
+export interface ActiveGroupCallInfo {
+  callId: string;
+  conversationId: string;
+  callType: CallType;
+  hostId: string;
+  hostName: string;
+  roomName: string;
+  startedAt: string;
+  participants?: Array<{ userId: string; displayName: string; joinedAt: string }>;
+}
+
 interface CallState {
   isReady: boolean;
   activeCalls: ActiveCall[];
@@ -98,6 +116,8 @@ interface CallState {
   isScreenSharing: boolean;
   groupCall: GroupCallState | null;
   incomingGroupInvite: IncomingGroupCallInvite | null;
+  /** Per-conversation active group call markers, keyed by conversationId. */
+  activeGroupCalls: Record<string, ActiveGroupCallInfo>;
 
   initWebRTC: (socket: any) => void;
   makeCall: (targetUserId: string, type: CallType, remoteName?: string, conversationId?: string) => Promise<void>;
@@ -118,6 +138,11 @@ interface CallState {
   leaveGroupCall: () => Promise<void>;
   endGroupCallForAll: () => Promise<void>;
   endGroupCall: () => void;
+  // Active-meeting tracking (for late-join banner)
+  refreshActiveGroupCall: (conversationId: string) => Promise<void>;
+  setActiveGroupCall: (info: ActiveGroupCallInfo) => void;
+  clearActiveGroupCall: (conversationId: string, callId?: string) => void;
+
   // (legacy helpers retained for any callers — no-ops in LiveKit mode)
   joinGroupCall: (conversationId: string, callType: CallType, groupName: string) => void;
   addGroupParticipant: (participant: GroupCallParticipant) => void;
@@ -202,6 +227,7 @@ export const useCallStore = create<CallState>((set, get) => {
     isScreenSharing: false,
     groupCall: null,
     incomingGroupInvite: null,
+    activeGroupCalls: {},
 
     initWebRTC: (socket) => {
       webrtcService.initSignaling(socket);
@@ -228,6 +254,17 @@ export const useCallStore = create<CallState>((set, get) => {
           ringtoneHandle?.stop();
           ringtoneHandle = null;
         }
+      });
+
+      // Persistent "meeting in progress" marker — appears as banner in chat window.
+      // Lets users who weren't online when the call started discover and join it.
+      socket.on('group-call:active', (info: ActiveGroupCallInfo) => {
+        useCallStore.getState().setActiveGroupCall(info);
+      });
+
+      // Clears the banner when the meeting is force-ended by the host.
+      socket.on('group-call:active-ended', (data: { conversationId: string; callId: string }) => {
+        useCallStore.getState().clearActiveGroupCall(data.conversationId, data.callId);
       });
     },
 
@@ -345,8 +382,26 @@ export const useCallStore = create<CallState>((set, get) => {
     },
 
     acceptGroupInvite: async (callId) => {
-      const invite = useCallStore.getState().incomingGroupInvite;
-      if (!invite || invite.callId !== callId) return;
+      // Look up context from either source:
+      //   1. `incomingGroupInvite` — a currently ringing call the user is being invited to
+      //   2. `activeGroupCalls` — a call already in progress that the user wants to LATE JOIN
+      // This makes the same flow work for both the IncomingGroupCallModal and the
+      // ActiveMeetingBanner Join button.
+      const state = useCallStore.getState();
+      const invite = state.incomingGroupInvite;
+      const activeEntry = Object.values(state.activeGroupCalls).find((c) => c.callId === callId);
+
+      const context = invite && invite.callId === callId
+        ? { conversationId: invite.conversationId, callType: invite.callType }
+        : activeEntry
+          ? { conversationId: activeEntry.conversationId, callType: activeEntry.callType }
+          : null;
+
+      if (!context) {
+        console.warn('[CallStore] acceptGroupInvite: no invite or active call found for', callId);
+        return;
+      }
+
       ringtoneHandle?.stop();
       ringtoneHandle = null;
       try {
@@ -355,8 +410,8 @@ export const useCallStore = create<CallState>((set, get) => {
           incomingGroupInvite: null,
           groupCall: {
             isActive: true,
-            conversationId: invite.conversationId,
-            callType: invite.callType,
+            conversationId: context.conversationId,
+            callType: context.callType,
             groupName: '',
             participants: [],
             startTime: new Date(),
@@ -409,6 +464,50 @@ export const useCallStore = create<CallState>((set, get) => {
     endGroupCall: () => {
       playCallEndedTone();
       set({ groupCall: null });
+    },
+
+    // ─── Active-meeting tracking (late-join banner) ───────────────────────────────
+
+    /** Fetch current active group call for a conversation from the backend. */
+    refreshActiveGroupCall: async (conversationId: string) => {
+      try {
+        const info = await livekitApi.getActiveGroupCall(conversationId);
+        if (info) {
+          set((s) => ({
+            activeGroupCalls: { ...s.activeGroupCalls, [conversationId]: info as ActiveGroupCallInfo },
+          }));
+        } else {
+          // No active call — clear any stale entry for this conv
+          set((s) => {
+            if (!s.activeGroupCalls[conversationId]) return s;
+            const next = { ...s.activeGroupCalls };
+            delete next[conversationId];
+            return { activeGroupCalls: next };
+          });
+        }
+      } catch (err: any) {
+        // Non-fatal — just leave the existing state alone
+        console.warn('[CallStore] refreshActiveGroupCall failed:', err?.response?.data?.error || err.message);
+      }
+    },
+
+    setActiveGroupCall: (info: ActiveGroupCallInfo) => {
+      set((s) => ({
+        activeGroupCalls: { ...s.activeGroupCalls, [info.conversationId]: info },
+      }));
+    },
+
+    clearActiveGroupCall: (conversationId: string, callId?: string) => {
+      set((s) => {
+        const existing = s.activeGroupCalls[conversationId];
+        // If a specific callId was provided, only clear if it matches (avoid races
+        // where a NEW call has already started before the OLD end event arrives).
+        if (callId && existing && existing.callId !== callId) return s;
+        if (!existing) return s;
+        const next = { ...s.activeGroupCalls };
+        delete next[conversationId];
+        return { activeGroupCalls: next };
+      });
     },
 
     // ─── Legacy no-op shims (kept for backward compat with any existing callers) ─

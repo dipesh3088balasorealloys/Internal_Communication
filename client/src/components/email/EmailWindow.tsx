@@ -1,10 +1,11 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Mail, Send, Paperclip, Bold, Italic, Underline, Link2, Image,
   Reply, ReplyAll, Forward, Trash2, Archive, Star, StarOff,
   ChevronDown, Plus, Inbox, SendHorizontal, FileText, Users,
   Search, MoreVertical, X, RefreshCw, Loader,
 } from 'lucide-react';
+import DOMPurify from 'dompurify';
 import { useAuthStore } from '@/stores/authStore';
 import api from '@/services/api';
 import { playMessageSound, showDesktopNotification } from '@/services/notification';
@@ -119,6 +120,11 @@ export default function EmailWindow() {
         attachments: e.attachments || [],
         status: e.status,
         folder: f,
+        // ── Threading headers — REQUIRED for reply chains, attachments in conversation history ──
+        // Without these, replies have no In-Reply-To header → threading is broken
+        messageId: e.messageId || e.message_id || undefined,
+        inReplyTo: e.inReplyTo || e.in_reply_to || undefined,
+        references: e.references || (e.email_references ? e.email_references.split(/\s+/).filter(Boolean) : undefined),
       }));
 
       // Detect new inbox emails and play notification sound
@@ -233,7 +239,7 @@ export default function EmailWindow() {
     setEmails(prev => prev.map(e => e.id === id ? { ...e, isStarred: !e.isStarred } : e));
   };
 
-  const handleSend = async (data: { to: string[]; cc: string[]; bcc: string[]; subject: string; body: string; attachments?: File[] }) => {
+  const handleSend = async (data: { to: string[]; cc: string[]; bcc: string[]; subject: string; body: string; attachments?: File[]; inReplyTo?: string; references?: string[] }) => {
     try {
       if (data.attachments && data.attachments.length > 0) {
         // Use FormData for attachments
@@ -244,6 +250,8 @@ export default function EmailWindow() {
         formData.append('subject', data.subject);
         formData.append('html', data.body);
         if (editingDraft?.id) formData.append('draftId', editingDraft.id);
+        if (data.inReplyTo) formData.append('inReplyTo', data.inReplyTo);
+        if (data.references?.length) formData.append('references', JSON.stringify(data.references));
         data.attachments.forEach(file => formData.append('attachments', file));
         await api.post('/email/send', formData, { headers: { 'Content-Type': 'multipart/form-data' } });
       } else {
@@ -254,6 +262,8 @@ export default function EmailWindow() {
           subject: data.subject,
           html: data.body,
           draftId: editingDraft?.id || undefined,
+          inReplyTo: data.inReplyTo || undefined,
+          references: data.references || undefined,
         });
       }
       setComposing(false);
@@ -589,12 +599,594 @@ function EmailListItem({ email, selected, onSelect, onStar, onDelete }: { email:
 }
 
 /* ===================================================================
-   EMAIL READER
+   EMAIL BODY PARSER — Splits reply chains into individual messages
+   =================================================================== */
+
+/** A single message in an email conversation */
+interface EmailSection {
+  type: 'main' | 'quoted';
+  html: string;
+  from?: string;
+  fromEmail?: string;
+  date?: string;
+  to?: string;
+  cc?: string;
+  subject?: string;
+}
+
+/** Sanitize HTML to prevent XSS and CSS bleed */
+function sanitizeEmailHtml(html: string): string {
+  if (!html) return '';
+  const clean = DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: [
+      'p', 'br', 'div', 'span', 'a', 'b', 'i', 'u', 'strong', 'em', 'ul', 'ol', 'li',
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'td', 'th',
+      'img', 'blockquote', 'pre', 'code', 'hr', 'sub', 'sup', 'font', 'center',
+      'small', 'big', 'abbr', 'cite', 'del', 'ins', 'mark', 'dl', 'dt', 'dd',
+      'caption', 'colgroup', 'col', 'figure', 'figcaption', 'section', 'article', 'header', 'footer',
+    ],
+    ALLOWED_ATTR: [
+      'href', 'src', 'alt', 'title', 'width', 'height', 'style', 'class', 'id',
+      'target', 'rel', 'colspan', 'rowspan', 'cellpadding', 'cellspacing', 'border',
+      'align', 'valign', 'bgcolor', 'color', 'size', 'face', 'dir', 'lang',
+    ],
+    ALLOW_DATA_ATTR: false,
+    ADD_ATTR: ['target'],
+  });
+  return clean;
+}
+
+/**
+ * Extract metadata from "On [date] [name] <email> wrote:" or "On [date], [name] wrote:" lines.
+ * Must correctly handle:
+ *   - Gmail: "On Tue, May 5, 2026, 10:29 AM DIPESH MONDAL <dipesh@gmail.com> wrote:"
+ *   - BAL Connect: "On 5/12/2026, 1:52:58 AM, Admin User wrote:"
+ *   - Generic: "On Mon, Apr 27, 2026 at 6:05 PM John Doe <john@example.com> wrote:"
+ */
+function parseWroteLine(text: string): { from?: string; fromEmail?: string; date?: string } | null {
+  // ── Format 1: with <email> ──
+  // "On [date+time] [name] <email> wrote:"
+  const withEmail = text.match(/^On\s+(.+)\s+<([^>]+)>\s*wrote:\s*$/);
+  if (withEmail) {
+    const beforeEmail = withEmail[1].trim(); // e.g. "Tue, May 5, 2026, 10:29 AM DIPESH MONDAL"
+    const email = withEmail[2].trim();
+    // Strategy: the name is the alphabetic words at the end.
+    // The date contains the last digit or AM/PM. Everything after that is the name.
+    const split = beforeEmail.match(/^(.*(?:\d|AM|PM))[,\s]+([A-Za-z].+)$/i);
+    if (split) {
+      return { date: split[1].trim(), from: split[2].trim(), fromEmail: email };
+    }
+    // Fallback: whole thing as name
+    return { from: beforeEmail, fromEmail: email };
+  }
+
+  // ── Format 2: without <email> (BAL Connect, Thunderbird, etc.) ──
+  // "On 5/12/2026, 1:52:58 AM, Admin User wrote:"
+  // Key: use GREEDY (.+) for date so it matches up to the LAST comma, leaving only the name after it.
+  const withoutEmail = text.match(/^On\s+(.+),\s+([A-Za-z][A-Za-z\s.'\-]+?)\s+wrote:\s*$/);
+  if (withoutEmail) {
+    return { date: withoutEmail[1].trim(), from: withoutEmail[2].trim() };
+  }
+
+  return null;
+}
+
+/** Extract Outlook-style "From: ... Sent: ... To: ..." block metadata */
+function parseOutlookHeader(text: string): Partial<EmailSection> {
+  const result: Partial<EmailSection> = {};
+  const fromMatch = text.match(/From:\s*(.+?)(?:\n|$)/i);
+  const sentMatch = text.match(/(?:Sent|Date):\s*(.+?)(?:\n|$)/i);
+  const toMatch = text.match(/To:\s*(.+?)(?:\n|$)/i);
+  const ccMatch = text.match(/Cc:\s*(.+?)(?:\n|$)/i);
+  const subjMatch = text.match(/Subject:\s*(.+?)(?:\n|$)/i);
+  if (fromMatch) {
+    const emailInFrom = fromMatch[1].match(/<([^>]+)>/);
+    result.from = fromMatch[1].replace(/<[^>]+>/, '').trim();
+    if (emailInFrom) result.fromEmail = emailInFrom[1];
+  }
+  if (sentMatch) result.date = sentMatch[1].trim();
+  if (toMatch) result.to = toMatch[1].trim();
+  if (ccMatch) result.cc = ccMatch[1].trim();
+  if (subjMatch) result.subject = subjMatch[1].trim();
+  return result;
+}
+
+/**
+ * Get the body HTML of an element, EXCLUDING nested blockquotes / gmail_quote divs.
+ * This extracts only THIS reply's content, not deeper replies.
+ */
+function getOwnBodyHtml(el: Element): string {
+  const clone = el.cloneNode(true) as Element;
+  // Remove nested gmail_quote wrappers
+  clone.querySelectorAll('.gmail_quote').forEach(q => q.remove());
+  // Remove nested blockquotes (reply chains)
+  clone.querySelectorAll('blockquote').forEach(q => q.remove());
+  // Remove "On ... wrote:" lines that precede blockquotes
+  clone.querySelectorAll('div, p, span').forEach(p => {
+    const txt = (p.textContent || '').trim();
+    if (/^On\s.+wrote:\s*$/.test(txt)) p.remove();
+  });
+  return clone.innerHTML;
+}
+
+/**
+ * Recursively parse Gmail-style nested blockquotes into individual sections.
+ * Gmail structure: "On ... wrote:" text → <blockquote class="gmail_quote"> with body + nested quote
+ *
+ * IMPORTANT: Gmail blockquotes often have class="gmail_quote" — we must NOT
+ * process them via both the class handler AND the "On wrote" handler, or we
+ * get exponential duplication (2^n sections instead of n).
+ */
+function parseGmailQuoteRecursive(container: Element, sections: EmailSection[], processed: Set<Element> = new Set()): void {
+  const children = Array.from(container.childNodes);
+
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const el = child as Element;
+
+    // Skip elements we've already processed (prevents double recursion)
+    if (processed.has(el)) continue;
+
+    // Check for gmail_quote DIV wrapper (NOT blockquote — those are handled below)
+    if (el.tagName !== 'BLOCKQUOTE' && el.classList?.contains('gmail_quote')) {
+      processed.add(el);
+      parseGmailQuoteRecursive(el, sections, processed);
+      continue;
+    }
+
+    // Check if this is an "On ... wrote:" line
+    const text = (el.textContent || '').trim();
+    if (/^On\s.+wrote:\s*$/.test(text)) {
+      const meta = parseWroteLine(text);
+      const nextEl = el.nextElementSibling;
+      if (nextEl && nextEl.tagName === 'BLOCKQUOTE') {
+        processed.add(nextEl); // Mark blockquote as processed
+        const bodyHtml = getOwnBodyHtml(nextEl);
+        sections.push({
+          type: 'quoted',
+          html: sanitizeEmailHtml(bodyHtml),
+          from: meta?.from,
+          fromEmail: meta?.fromEmail,
+          date: meta?.date,
+        });
+        // Recurse into the blockquote for deeper nested replies
+        parseGmailQuoteRecursive(nextEl, sections, processed);
+      }
+      continue;
+    }
+
+    // Standalone blockquote (not preceded by "On wrote:", not already processed)
+    if (el.tagName === 'BLOCKQUOTE') {
+      processed.add(el);
+      const bodyHtml = getOwnBodyHtml(el);
+      if (bodyHtml.trim()) {
+        sections.push({ type: 'quoted', html: sanitizeEmailHtml(bodyHtml) });
+      }
+      parseGmailQuoteRecursive(el, sections, processed);
+    }
+  }
+}
+
+/**
+ * Parse an email HTML body into individual message sections.
+ * Each reply becomes its own section with metadata — rendered as separate cards.
+ */
+function parseEmailSections(html: string): EmailSection[] {
+  if (!html) return [{ type: 'main', html: '' }];
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  const sections: EmailSection[] = [];
+
+  // ===== Strategy 1: Outlook-style (multiple #divRplyFwdMsg markers) =====
+  const outlookDividers = doc.querySelectorAll(
+    '#divRplyFwdMsg, [id^="divRply"], [id^="divRpt"], div.OutlookMessageHeader'
+  );
+
+  if (outlookDividers.length > 0) {
+    // Get content BEFORE the first divider = main message
+    const firstDivider = outlookDividers[0];
+    const mainRange = doc.createRange();
+    mainRange.setStartBefore(doc.body.firstChild || doc.body);
+    mainRange.setEndBefore(firstDivider);
+    const mainFrag = mainRange.cloneContents();
+    const mainDiv = doc.createElement('div');
+    mainDiv.appendChild(mainFrag);
+    sections.push({ type: 'main', html: sanitizeEmailHtml(mainDiv.innerHTML) });
+
+    // Each divider starts a new quoted reply
+    for (let i = 0; i < outlookDividers.length; i++) {
+      const divider = outlookDividers[i];
+      const replyRange = doc.createRange();
+      replyRange.setStartBefore(divider);
+      if (i + 1 < outlookDividers.length) {
+        replyRange.setEndBefore(outlookDividers[i + 1]);
+      } else if (doc.body.lastChild) {
+        replyRange.setEndAfter(doc.body.lastChild);
+      }
+      const replyFrag = replyRange.cloneContents();
+      const replyDiv = doc.createElement('div');
+      replyDiv.appendChild(replyFrag);
+      const replyText = replyDiv.textContent || '';
+      const meta = parseOutlookHeader(replyText);
+
+      // Remove the header block from the body display
+      const headerEl = replyDiv.querySelector('#divRplyFwdMsg, [id^="divRply"], [id^="divRpt"], div.OutlookMessageHeader');
+      if (headerEl) {
+        // Find and remove the header lines (From/Sent/To/Subject) that follow the divider
+        let nextSib = headerEl.nextElementSibling;
+        // The header itself might contain the metadata
+        headerEl.remove();
+        // Also remove explicit header paragraphs that contain "From:", "Sent:", etc.
+        const headerPs = replyDiv.querySelectorAll('p, div');
+        let removedHeaders = 0;
+        for (const p of headerPs) {
+          const pText = (p.textContent || '').trim();
+          if (removedHeaders < 6 && /^(From|Sent|Date|To|Cc|Subject):\s/i.test(pText)) {
+            p.remove();
+            removedHeaders++;
+          }
+        }
+      }
+      // Also remove any leading <hr>
+      const firstChild = replyDiv.firstElementChild;
+      if (firstChild?.tagName === 'HR') firstChild.remove();
+
+      sections.push({
+        type: 'quoted',
+        html: sanitizeEmailHtml(replyDiv.innerHTML),
+        ...meta,
+      });
+    }
+    return sections;
+  }
+
+  // ===== Strategy 2: Gmail-style nested blockquotes =====
+  const gmailQuotes = doc.querySelectorAll('.gmail_quote');
+  // Also check for "On ... wrote:" + blockquote pattern (generic Gmail-like)
+  const hasWrotePattern = Array.from(doc.querySelectorAll('div, p, span')).some(
+    el => /^On\s.+wrote:\s*$/.test((el.textContent || '').trim())
+  );
+
+  if (gmailQuotes.length > 0 || hasWrotePattern) {
+    // Main message = everything before the first gmail_quote or "On...wrote:" line
+    let splitEl: Element | null = gmailQuotes[0] || null;
+
+    if (!splitEl) {
+      // Find the first "On ... wrote:" element
+      for (const el of doc.querySelectorAll('div, p, span')) {
+        if (/^On\s.+wrote:\s*$/.test((el.textContent || '').trim())) {
+          splitEl = el;
+          break;
+        }
+      }
+    }
+
+    if (splitEl) {
+      const mainRange = doc.createRange();
+      mainRange.setStartBefore(doc.body.firstChild || doc.body);
+      mainRange.setEndBefore(splitEl);
+      const mainFrag = mainRange.cloneContents();
+      const mainDiv = doc.createElement('div');
+      mainDiv.appendChild(mainFrag);
+      sections.push({ type: 'main', html: sanitizeEmailHtml(mainDiv.innerHTML) });
+
+      // Recursively parse all nested replies
+      // Start from the body, looking for the quote chain
+      parseGmailQuoteRecursive(doc.body, sections);
+    }
+
+    if (sections.length > 0) return sections;
+  }
+
+  // ===== Strategy 3: Plain blockquote chain (Apple Mail, Thunderbird) =====
+  const blockquotes = doc.querySelectorAll('blockquote[type="cite"], blockquote.cite');
+  if (blockquotes.length > 0) {
+    const firstBq = blockquotes[0];
+    // Content before blockquote = main message
+    const mainRange = doc.createRange();
+    mainRange.setStartBefore(doc.body.firstChild || doc.body);
+    // Check for "wrote:" line before blockquote
+    const prevEl = firstBq.previousElementSibling;
+    if (prevEl && /wrote:\s*$/.test(prevEl.textContent || '')) {
+      mainRange.setEndBefore(prevEl);
+    } else {
+      mainRange.setEndBefore(firstBq);
+    }
+    const mainFrag = mainRange.cloneContents();
+    const mainDiv = doc.createElement('div');
+    mainDiv.appendChild(mainFrag);
+    sections.push({ type: 'main', html: sanitizeEmailHtml(mainDiv.innerHTML) });
+
+    // Each nested blockquote = one reply level
+    let currentBq: Element | null = firstBq;
+    while (currentBq) {
+      const bodyHtml = getOwnBodyHtml(currentBq);
+      // Try to extract metadata from the "wrote:" line preceding this blockquote
+      const prevSib = currentBq.previousElementSibling;
+      let meta: Partial<EmailSection> = {};
+      if (prevSib && /wrote:\s*$/.test(prevSib.textContent || '')) {
+        const parsed = parseWroteLine((prevSib.textContent || '').trim());
+        if (parsed) meta = parsed;
+      }
+      if (bodyHtml.trim()) {
+        sections.push({ type: 'quoted', html: sanitizeEmailHtml(bodyHtml), ...meta });
+      }
+      // Go deeper
+      currentBq = currentBq.querySelector('blockquote[type="cite"], blockquote.cite, blockquote');
+    }
+    if (sections.length > 1) return sections;
+  }
+
+  // ===== Strategy 4: HR-separated or text-pattern separated =====
+  // Look for <hr> followed by "From:" headers
+  const hrs = doc.querySelectorAll('hr');
+  const hrSplits: Element[] = [];
+  for (const hr of hrs) {
+    const next = hr.nextElementSibling;
+    if (next && /^(from|on\s)/i.test((next.textContent || '').trim())) {
+      hrSplits.push(hr);
+    }
+  }
+
+  if (hrSplits.length > 0) {
+    // Main = before first HR
+    const mainRange = doc.createRange();
+    mainRange.setStartBefore(doc.body.firstChild || doc.body);
+    mainRange.setEndBefore(hrSplits[0]);
+    const mainFrag = mainRange.cloneContents();
+    const mainDiv = doc.createElement('div');
+    mainDiv.appendChild(mainFrag);
+    sections.push({ type: 'main', html: sanitizeEmailHtml(mainDiv.innerHTML) });
+
+    for (let i = 0; i < hrSplits.length; i++) {
+      const replyRange = doc.createRange();
+      replyRange.setStartBefore(hrSplits[i]);
+      if (i + 1 < hrSplits.length) {
+        replyRange.setEndBefore(hrSplits[i + 1]);
+      } else if (doc.body.lastChild) {
+        replyRange.setEndAfter(doc.body.lastChild);
+      }
+      const replyFrag = replyRange.cloneContents();
+      const replyDiv = doc.createElement('div');
+      replyDiv.appendChild(replyFrag);
+      const meta = parseOutlookHeader(replyDiv.textContent || '');
+      // Remove the <hr> from display
+      const hrInDiv = replyDiv.querySelector('hr');
+      if (hrInDiv) hrInDiv.remove();
+      sections.push({ type: 'quoted', html: sanitizeEmailHtml(replyDiv.innerHTML), ...meta });
+    }
+    return sections;
+  }
+
+  // ===== No split detected — entire email is one body =====
+  return [{ type: 'main', html: sanitizeEmailHtml(html) }];
+}
+
+/** Attachment download handler */
+function downloadAttachment(att: any) {
+  const folderParam = att.folder ? `?folder=${encodeURIComponent(att.folder)}` : '';
+  const url = att.source === 'imap'
+    ? `/email/imap-attachment/${att.uid}/${att.index}${folderParam}`
+    : att.id ? `/email/attachment/${att.id}?name=${encodeURIComponent(att.name)}` : null;
+  if (!url) return;
+  api.get(url, { responseType: 'blob' }).then(response => {
+    const blob = new Blob([response.data]);
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = att.name || 'attachment';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
+  }).catch(() => alert('Failed to download attachment'));
+}
+
+/** Attachment chips row */
+function AttachmentRow({ attachments }: { attachments: any[] }) {
+  if (!attachments || attachments.length === 0) return null;
+  return (
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '12px 0' }}>
+      {attachments.map((att: any, i: number) => (
+        <div
+          key={i}
+          onClick={() => downloadAttachment(att)}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px',
+            background: '#F5F5F5', borderRadius: 8, border: '1px solid #E8E8E8',
+            cursor: 'pointer', transition: 'all 0.15s',
+          }}
+          onMouseEnter={e => { e.currentTarget.style.background = '#EBF5FF'; e.currentTarget.style.borderColor = '#0078D4'; }}
+          onMouseLeave={e => { e.currentTarget.style.background = '#F5F5F5'; e.currentTarget.style.borderColor = '#E8E8E8'; }}
+        >
+          <Paperclip size={14} color="#0078D4" />
+          <span style={{ fontSize: 12, fontWeight: 500, color: '#0078D4' }}>{att.name}</span>
+          {att.size > 0 && <span style={{ fontSize: 10, color: '#8B8CA7' }}>({formatFileSize(att.size)})</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ===================================================================
+   EMAIL READER — Outlook-style conversation view with separate cards
    =================================================================== */
 function EmailReader({ email, onReply, onReplyAll, onForward, onDelete, onStar }: {
   email: any; onReply: () => void; onReplyAll: () => void; onForward: () => void; onDelete: () => void; onStar: () => void;
 }) {
-  const color = getAvatarColor(email.from);
+  const [showHistory, setShowHistory] = useState(false);
+  const [expandedCards, setExpandedCards] = useState<Set<number>>(new Set());
+  const [threadEmails, setThreadEmails] = useState<any[]>([]);
+  const [threadLoaded, setThreadLoaded] = useState(false);
+  const [threadLoading, setThreadLoading] = useState(false);
+
+  // Parse the email body into individual message sections (fallback)
+  const sections = useMemo(() => parseEmailSections(email.body || ''), [email.body]);
+  const mainSection = sections[0];
+  const parsedOlderMessages = sections.slice(1);
+
+  // Check if we can fetch the thread from IMAP using Message-ID headers
+  const hasReferences = email.references && email.references.length > 0;
+  const hasInReplyTo = !!email.inReplyTo;
+  const canLoadThread = hasReferences || hasInReplyTo;
+
+  // Show thread emails if loaded from IMAP, otherwise show parsed HTML sections
+  const olderMessages = threadLoaded && threadEmails.length > 0 ? threadEmails : parsedOlderMessages;
+  const hasHistory = olderMessages.length > 0 || canLoadThread;
+
+  // Reset when email changes
+  useEffect(() => {
+    setShowHistory(false); setExpandedCards(new Set()); setThreadEmails([]); setThreadLoaded(false);
+    // Diagnostic log: what threading info does the viewed email have?
+    console.log('[READER] Viewing email — id=', email.id, 'subject=', email.subject, 'messageId=', email.messageId, 'inReplyTo=', email.inReplyTo, 'references=', email.references);
+  }, [email.id]);
+
+  /**
+   * Fetch full thread emails from IMAP (with attachments).
+   *
+   * Uses ONLY Message-ID based threading (References + In-Reply-To headers).
+   * Never searches by subject — that approach mixes unrelated conversations.
+   *
+   * For old emails without these headers: shows parsed HTML sections (text only).
+   * All NEW replies from BAL Connect include proper threading headers.
+   */
+  const loadThread = async () => {
+    if (threadLoaded || threadLoading) return;
+    setThreadLoading(true);
+    try {
+      // Collect ALL hints we have about this email's thread.
+      // The server uses these in priority order:
+      //   1. Direct Message-ID search (References + In-Reply-To headers)
+      //   2. Reverse lookup: find emails this reply was a parent of OR child of, via DB
+      //   3. Body-based discovery: parse "On X, Y wrote:" quote markers from body content
+      const messageIdSet = new Set<string>();
+      if (email.references) {
+        for (const ref of email.references) {
+          if (ref) messageIdSet.add(ref);
+        }
+      }
+      if (email.inReplyTo) messageIdSet.add(email.inReplyTo);
+
+      const params: Record<string, string> = {};
+      if (messageIdSet.size > 0) {
+        params.messageIds = Array.from(messageIdSet).join(',');
+      }
+      // Pass the current email's own Message-ID so server can do reverse lookup
+      // (find emails in DB that reference this one as their parent)
+      if (email.messageId) params.currentMessageId = email.messageId;
+
+      const { data } = await api.get('/email/thread', { params });
+      if (data.emails?.length > 0) {
+        setThreadEmails(data.emails);
+      }
+    } catch (err) {
+      console.warn('[EMAIL] Thread load failed:', err);
+    }
+    setThreadLoaded(true);
+    setThreadLoading(false);
+  };
+
+  const handleToggleHistory = () => {
+    const newShow = !showHistory;
+    setShowHistory(newShow);
+    if (newShow && !threadLoaded) loadThread();
+  };
+
+  const toggleCard = (idx: number) => {
+    setExpandedCards(prev => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx); else next.add(idx);
+      return next;
+    });
+  };
+
+  /** Render a card — works for both thread emails and parsed sections */
+  const renderCard = (item: any, idx: number, isThread: boolean) => {
+    const senderName = isThread ? (item.from || 'Unknown') : (item.from || 'Unknown');
+    const senderEmail = isThread ? (item.fromEmail || '') : (item.fromEmail || '');
+    const senderDate = isThread
+      ? new Date(item.date).toLocaleString('en', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })
+      : (item.date || '');
+    const toLine = isThread ? (item.to || []).join('; ') : (item.to || '');
+    const ccLine = isThread ? (item.cc || []).join('; ') : (item.cc || '');
+    const attachments = isThread ? (item.attachments || []) : [];
+    const avatarColor = getAvatarColor(senderName);
+    const isExpanded = expandedCards.has(idx);
+
+    // Body: for thread emails, parse to strip quoted chain; for parsed sections, use directly
+    const bodyHtml = isThread
+      ? sanitizeEmailHtml(parseEmailSections(item.body || '')[0]?.html || item.body || '')
+      : item.html;
+    const previewText = bodyHtml.replace(/<[^>]*>/g, '').trim().substring(0, 120);
+
+    return (
+      <div key={idx} style={{
+        background: '#fff', borderRadius: 8, border: '1px solid #E8E8F0',
+        overflow: 'hidden', marginBottom: 8,
+      }}>
+        <div
+          onClick={() => toggleCard(idx)}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 12,
+            padding: isExpanded ? '14px 20px' : '10px 20px',
+            background: isExpanded ? '#FAFBFC' : '#fff',
+            borderBottom: isExpanded ? '1px solid #F0F0F0' : 'none',
+            cursor: 'pointer', transition: 'all 0.15s',
+          }}
+          onMouseEnter={e => { e.currentTarget.style.background = '#F8F9FC'; }}
+          onMouseLeave={e => { e.currentTarget.style.background = isExpanded ? '#FAFBFC' : '#fff'; }}
+        >
+          <div style={{
+            width: isExpanded ? 40 : 34, height: isExpanded ? 40 : 34,
+            borderRadius: '50%', background: avatarColor,
+            color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: isExpanded ? 14 : 12, fontWeight: 600, flexShrink: 0,
+          }}>
+            {getInitials(senderName)}
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {isExpanded ? (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 14, fontWeight: 600, color: '#242424' }}>{senderName}</span>
+                  {senderEmail && <span style={{ fontSize: 12, color: '#8B8CA7' }}>&lt;{senderEmail}&gt;</span>}
+                </div>
+                {toLine && <div style={{ fontSize: 12, color: '#605E5C', marginTop: 3 }}><span style={{ fontWeight: 600, color: '#8B8CA7' }}>To: </span>{toLine}</div>}
+                {ccLine && <div style={{ fontSize: 12, color: '#605E5C', marginTop: 2 }}><span style={{ fontWeight: 600, color: '#8B8CA7' }}>Cc: </span>{ccLine}</div>}
+              </>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 600, color: '#242424', flexShrink: 0 }}>{senderName}</span>
+                <span style={{ fontSize: 12, color: '#8B8CA7', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                  {previewText || '(No content)'}
+                </span>
+              </div>
+            )}
+          </div>
+          <span style={{ fontSize: 12, color: '#8B8CA7', flexShrink: 0, whiteSpace: 'nowrap' }}>{senderDate}</span>
+          <ChevronDown size={14} style={{
+            color: '#8B8CA7', flexShrink: 0,
+            transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
+            transition: 'transform 0.2s',
+          }} />
+        </div>
+        {isExpanded && (
+          <>
+            {attachments.length > 0 && (
+              <div style={{ padding: '8px 20px 0' }}>
+                <AttachmentRow attachments={attachments} />
+              </div>
+            )}
+            <div style={{ padding: '14px 20px 18px' }}>
+              <div className="email-body-content" style={{ fontSize: 14, lineHeight: 1.7, color: '#333', fontFamily: "'Segoe UI', 'Helvetica Neue', Arial, sans-serif", wordBreak: 'break-word', overflowWrap: 'break-word' }}
+                dangerouslySetInnerHTML={{ __html: bodyHtml }} />
+            </div>
+          </>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -611,85 +1203,115 @@ function EmailReader({ email, onReply, onReplyAll, onForward, onDelete, onStar }
       </div>
 
       {/* Email Content */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '24px 32px' }}>
+      <div style={{ flex: 1, overflowY: 'auto', padding: '20px 28px' }}>
         {/* Subject */}
-        <h2 style={{ fontSize: 20, fontWeight: 600, color: '#1A1A2E', margin: '0 0 20px' }}>{email.subject}</h2>
+        <h2 style={{ fontSize: 20, fontWeight: 600, color: '#1A1A2E', margin: '0 0 16px', lineHeight: 1.3 }}>
+          {email.subject}
+        </h2>
 
-        {/* Sender Row */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+        {/* ── Latest Message — always expanded ── */}
+        <div style={{
+          background: '#fff', borderRadius: 8, border: '1px solid #E8E8F0',
+          overflow: 'hidden', marginBottom: 8, boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+        }}>
           <div style={{
-            width: 40, height: 40, borderRadius: '50%', background: color,
-            color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 14, fontWeight: 600, flexShrink: 0,
+            display: 'flex', alignItems: 'flex-start', gap: 12,
+            padding: '14px 20px', background: '#FAFBFC', borderBottom: '1px solid #F0F0F0',
           }}>
-            {getInitials(email.from)}
-          </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 14, fontWeight: 600, color: '#242424' }}>{email.from}</span>
-              <span style={{ fontSize: 12, color: '#8B8CA7' }}>&lt;{email.fromEmail}&gt;</span>
+            <div style={{
+              width: 40, height: 40, borderRadius: '50%', background: getAvatarColor(email.from),
+              color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 14, fontWeight: 600, flexShrink: 0, marginTop: 2,
+            }}>
+              {getInitials(email.from)}
             </div>
-            <div style={{ fontSize: 12, color: '#8B8CA7', marginTop: 2 }}>
-              To: {(email.to || []).join(', ')}
-              {email.cc?.length > 0 && <span> | Cc: {email.cc.join(', ')}</span>}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 14, fontWeight: 600, color: '#242424' }}>{email.from}</span>
+                <span style={{ fontSize: 12, color: '#8B8CA7' }}>&lt;{email.fromEmail}&gt;</span>
+              </div>
+              <div style={{ fontSize: 12, color: '#605E5C', marginTop: 3, lineHeight: 1.5 }}>
+                <span style={{ fontWeight: 600, color: '#8B8CA7' }}>To: </span>{(email.to || []).join('; ')}
+              </div>
+              {email.cc?.length > 0 && (
+                <div style={{ fontSize: 12, color: '#605E5C', marginTop: 2, lineHeight: 1.5 }}>
+                  <span style={{ fontWeight: 600, color: '#8B8CA7' }}>Cc: </span>{email.cc.join('; ')}
+                </div>
+              )}
             </div>
+            <span style={{ fontSize: 12, color: '#8B8CA7', flexShrink: 0, whiteSpace: 'nowrap', marginTop: 2 }}>
+              {new Date(email.date).toLocaleString('en', {
+                weekday: 'short', year: 'numeric', month: 'short', day: 'numeric',
+                hour: 'numeric', minute: '2-digit', hour12: true,
+              })}
+            </span>
           </div>
-          <span style={{ fontSize: 12, color: '#8B8CA7', flexShrink: 0 }}>
-            {new Date(email.date).toLocaleString('en', { dateStyle: 'medium', timeStyle: 'short' })}
-          </span>
+          {email.attachments?.length > 0 && (
+            <div style={{ padding: '8px 20px 0' }}>
+              <AttachmentRow attachments={email.attachments} />
+            </div>
+          )}
+          <div style={{ padding: '14px 20px 18px' }}>
+            <div className="email-body-content" style={{
+              fontSize: 14, lineHeight: 1.7, color: '#333',
+              fontFamily: "'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+              wordBreak: 'break-word', overflowWrap: 'break-word',
+            }} dangerouslySetInnerHTML={{ __html: mainSection.html }} />
+          </div>
         </div>
 
-        {/* Attachments with download */}
-        {email.attachments?.length > 0 && (
-          <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
-            {email.attachments.map((att: any, i: number) => {
-              const handleDownload = async () => {
-                try {
-                  const url = att.source === 'imap'
-                    ? `/email/imap-attachment/${att.uid}/${att.index}`
-                    : att.id ? `/email/attachment/${att.id}?name=${encodeURIComponent(att.name)}` : null;
-                  if (!url) return;
-                  const response = await api.get(url, { responseType: 'blob' });
-                  const blob = new Blob([response.data]);
-                  const link = document.createElement('a');
-                  link.href = URL.createObjectURL(blob);
-                  link.download = att.name || 'attachment';
-                  document.body.appendChild(link);
-                  link.click();
-                  document.body.removeChild(link);
-                  URL.revokeObjectURL(link.href);
-                } catch (err) {
-                  console.error('Download failed:', err);
-                  alert('Failed to download attachment');
+        {/* ── Older Messages ── */}
+        {hasHistory && (
+          <div style={{ marginTop: 4 }}>
+            <button
+              onClick={handleToggleHistory}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '8px 16px', margin: '4px 0 10px',
+                background: showHistory ? '#F0F4FF' : '#F8F8FC',
+                border: '1px solid #E0E0E8', borderRadius: 6, cursor: 'pointer',
+                fontSize: 12, fontWeight: 500, color: '#0078D4', transition: 'all 0.15s',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.background = '#E8EFFF'; e.currentTarget.style.borderColor = '#0078D4'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = showHistory ? '#F0F4FF' : '#F8F8FC'; e.currentTarget.style.borderColor = '#E0E0E8'; }}
+            >
+              {threadLoading ? (
+                <div style={{ width: 14, height: 14, border: '2px solid #0078D4', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+              ) : (
+                <ChevronDown size={14} style={{
+                  transform: showHistory ? 'rotate(180deg)' : 'rotate(0deg)',
+                  transition: 'transform 0.2s',
+                }} />
+              )}
+              <span>
+                {threadLoading
+                  ? 'Loading conversation history…'
+                  : showHistory
+                    ? 'Hide message history'
+                    : canLoadThread && !threadLoaded
+                      ? 'Show full conversation history'
+                      : `Show message history (${olderMessages.length} earlier ${olderMessages.length === 1 ? 'message' : 'messages'})`
                 }
-              };
-              return (
-                <div
-                  key={i}
-                  onClick={handleDownload}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px',
-                    background: '#F5F5F5', borderRadius: 8, border: '1px solid #E8E8E8',
-                    cursor: 'pointer', transition: 'background 0.12s',
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.background = '#EBF5FF'; e.currentTarget.style.borderColor = '#0078D4'; }}
-                  onMouseLeave={e => { e.currentTarget.style.background = '#F5F5F5'; e.currentTarget.style.borderColor = '#E8E8E8'; }}
-                >
-                  <Paperclip size={14} color="#0078D4" />
-                  <span style={{ fontSize: 12, fontWeight: 500, color: '#0078D4' }}>{att.name}</span>
-                  <span style={{ fontSize: 10, color: '#8B8CA7' }}>({formatFileSize(att.size)})</span>
-                </div>
-              );
+              </span>
+            </button>
+            {showHistory && olderMessages.map((item, idx) => {
+              const isThread = threadLoaded && threadEmails.length > 0;
+              return renderCard(item, idx, isThread);
             })}
           </div>
         )}
-
-        {/* Body */}
-        <div
-          style={{ fontSize: 14, lineHeight: 1.7, color: '#333', fontFamily: 'Segoe UI, sans-serif' }}
-          dangerouslySetInnerHTML={{ __html: email.body }}
-        />
       </div>
+
+      {/* Scoped CSS */}
+      <style>{`
+        .email-body-content img { max-width: 100%; height: auto; }
+        .email-body-content table { max-width: 100%; border-collapse: collapse; }
+        .email-body-content a { color: #0078D4; }
+        .email-body-content blockquote { border-left: 3px solid #D0D0D8; padding-left: 12px; margin: 8px 0; color: #666; }
+        .email-body-content pre, .email-body-content code { background: #F5F5F5; padding: 2px 6px; border-radius: 4px; font-size: 13px; font-family: 'Consolas', monospace; }
+        .email-body-content * { max-width: 100% !important; box-sizing: border-box; }
+        .email-body-content style, .email-body-content link { display: none !important; }
+      `}</style>
     </div>
   );
 }
@@ -883,7 +1505,7 @@ function RecipientField({
    =================================================================== */
 function EmailCompose({ userEmail, userName, replyTo, forwardEmail, editingDraft, onSend, onSaveDraft, onDiscard }: {
   userEmail: string; userName: string; replyTo?: any; forwardEmail?: any; editingDraft?: any;
-  onSend: (data: { to: string[]; cc: string[]; bcc: string[]; subject: string; body: string; attachments?: File[] }) => void;
+  onSend: (data: { to: string[]; cc: string[]; bcc: string[]; subject: string; body: string; attachments?: File[]; inReplyTo?: string; references?: string[] }) => void;
   onSaveDraft?: (data: { to: string[]; cc: string[]; bcc: string[]; subject: string; body: string }) => void;
   onDiscard: () => void;
 }) {
@@ -960,7 +1582,18 @@ function EmailCompose({ userEmail, userName, replyTo, forwardEmail, editingDraft
   const handleSend = () => {
     if (to.length === 0) { alert('Please add at least one recipient'); return; }
     setSending(true);
-    onSend({ to, cc, bcc, subject, body: bodyRef.current?.innerHTML || '', attachments: attachments.length > 0 ? attachments : undefined });
+    // Build threading headers when replying
+    let inReplyTo: string | undefined;
+    let references: string[] | undefined;
+    if (replyTo?.messageId) {
+      inReplyTo = replyTo.messageId;
+      // References = all previous references + the message being replied to
+      const prevRefs: string[] = replyTo.references || [];
+      references = [...prevRefs, replyTo.messageId];
+    }
+    // Diagnostic log — visible in browser DevTools console
+    console.log('[COMPOSE] Sending email. replyTo.messageId=', replyTo?.messageId, 'inReplyTo=', inReplyTo, 'references=', references);
+    onSend({ to, cc, bcc, subject, body: bodyRef.current?.innerHTML || '', attachments: attachments.length > 0 ? attachments : undefined, inReplyTo, references });
   };
 
   return (
