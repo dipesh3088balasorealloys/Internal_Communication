@@ -326,7 +326,7 @@ router.get('/contacts', async (req: AuthRequest, res: Response) => {
        WHERE is_active = true
          AND ($1 = '%%' OR LOWER(display_name) LIKE $1 OR LOWER(email) LIKE $1)
        ORDER BY display_name ASC
-       LIMIT 20`,
+       LIMIT 500`,
       [search]
     );
     res.json({ contacts: result.rows });
